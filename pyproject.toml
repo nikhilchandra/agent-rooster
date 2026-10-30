@@ -3,7 +3,9 @@ name = "agent-rooster"
 version = "0.1.0"
 description = "Infrastructure for building agentic workflows on the Claude Code CLI."
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "claude-agent-sdk>=0.2.160",
+]
 
 [dependency-groups]
 dev = ["pytest>=8"]
