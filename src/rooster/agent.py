@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
-import uuid
 from datetime import datetime, timezone
 from enum import Flag, StrEnum, auto
 from pathlib import Path
@@ -127,9 +126,10 @@ class Agent:
         self.log_dir = log_dir
 
         self._exe = exe
-        # the id is minted up front so logs can be named after it before the first call returns
-        self.session_id = session_id or str(uuid.uuid4())
-        self._started = False
+        # the CLI mints the id and reports it on the first reply. so None means this agent has
+        # never run, and an id can only have come from a call that completed — which is what
+        # lets a failed resume mean "expired" rather than "not created yet"
+        self.session_id = session_id
 
         self.results: list[dict] = []
         self.total_cost_usd = 0.0
@@ -144,9 +144,9 @@ class Agent:
         """Runs a turn in this agent's own session, so it remembers its earlier turns."""
         result = self._invoke(prompt, continuity=True)
         self._record(result)
-        # only mark the session live once a turn has actually produced one
+        # adopt whatever session the CLI used, so every later turn rejoins this conversation
         if result["ok"] and result["session_id"]:
-            self._started = True
+            self.session_id = result["session_id"]
         return result
 
     def run_fresh(self, prompt: str) -> dict:
@@ -162,9 +162,8 @@ class Agent:
         self.total_tokens += result["total_tokens"]
 
     def reset(self) -> None:
-        """Mints a new session id so the next run starts a fresh conversation."""
-        self.session_id = str(uuid.uuid4())
-        self._started = False
+        """Forgets the session so the next run starts a fresh conversation."""
+        self.session_id = None
 
     def _argv(self, *, continuity: bool) -> list[str]:
         """Assembles the command line for one turn."""
@@ -203,9 +202,9 @@ class Agent:
         if self.max_work_usd is not None:
             argv += ["--max-budget-usd", str(self.max_work_usd)]
 
-        if continuity:
-            # the first turn creates the session under our id; later turns rejoin it
-            argv += ["--resume", self.session_id] if self._started else ["--session-id", self.session_id]
+        # one rule, no state: rejoin a session we have, and let the CLI mint one when we do not
+        if continuity and self.session_id:
+            argv += ["--resume", self.session_id]
 
         return argv
 
@@ -240,6 +239,7 @@ class Agent:
             "stop_reason": None,
             "denials": [],
             "failure": reason,
+            "session_expired": False,
             "log_path": log_path,
         }
         result.update(extra)
@@ -270,8 +270,17 @@ class Agent:
         stderr = proc.stderr or ""
         log_path = self._write_log(argv, stdout, stderr)
 
-        # the CLI itself failed: a bad flag, an auth problem, or a crash
         if proc.returncode != 0:
+            # the session we asked to rejoin is gone, which costs nothing to discover. it is
+            # never retried on a fresh session: a prompt written for an agent that remembers
+            # is meaningless to one that does not, and it would answer anyway
+            if "No conversation found with session ID" in (stderr + stdout):
+                return self._failed(
+                    f"the session {self.session_id} has expired or was deleted",
+                    log_path,
+                    session_expired=True,
+                )
+            # otherwise the CLI itself failed: a bad flag, an auth problem, or a crash
             detail = (stderr.strip() or stdout.strip()).splitlines()
             first = detail[0][:300] if detail else "no output"
             return self._failed(f"exit {proc.returncode}: {first}", log_path)
@@ -315,6 +324,7 @@ class Agent:
             "stop_reason": envelope.get("stop_reason"),
             "denials": envelope.get("permission_denials") or [],
             "failure": None,
+            "session_expired": False,
             "log_path": log_path,
         }
 

@@ -61,35 +61,56 @@ def test_empty_allowlist_denies_every_tool(tmp_path: Path) -> None:
     assert "Bash" in argv and "Edit" in argv
 
 
-def test_first_turn_creates_a_session_and_later_turns_resume_it(tmp_path: Path) -> None:
-    """Proves the minted id is used to create the session, then to rejoin it."""
+def test_a_new_agent_asks_for_no_particular_session(tmp_path: Path) -> None:
+    """Proves a first call carries no session flag, leaving the CLI to mint the id."""
     profile = tmp_path / "p.md"
     profile.write_text("x", encoding="utf-8")
     agent = Agent("a", profile, cwd=tmp_path)
 
-    first = _argv_for(agent)
-    assert "--session-id" in first and agent.session_id in first
-    assert "--resume" not in first
+    argv = _argv_for(agent)
 
-    # pretend the first turn succeeded
-    agent._started = True
-    later = _argv_for(agent)
-    assert "--resume" in later and agent.session_id in later
-    assert "--session-id" not in later
+    assert agent.session_id is None
+    assert "--session-id" not in argv
+    assert "--resume" not in argv
 
 
-def test_reset_mints_a_new_session(tmp_path: Path) -> None:
-    """Proves reset abandons the old conversation without discarding the result history."""
+def test_an_agent_holding_an_id_always_resumes(tmp_path: Path) -> None:
+    """Proves a saved id means rejoin, which is what makes a run survive a human gate."""
     profile = tmp_path / "p.md"
     profile.write_text("x", encoding="utf-8")
-    agent = Agent("a", profile, cwd=tmp_path)
-    original = agent.session_id
-    agent._started = True
+    saved = "28aff200-76ed-4718-a98a-0d67857acbb5"
+
+    agent = Agent("a", profile, cwd=tmp_path, session_id=saved)
+
+    argv = _argv_for(agent)
+    # --session-id on an existing session is rejected as "already in use", so it must never appear
+    assert "--resume" in argv and saved in argv
+    assert "--session-id" not in argv
+
+
+def test_reset_forgets_the_session(tmp_path: Path) -> None:
+    """Proves reset abandons the conversation without discarding the result history."""
+    profile = tmp_path / "p.md"
+    profile.write_text("x", encoding="utf-8")
+    agent = Agent("a", profile, cwd=tmp_path, session_id="something")
 
     agent.reset()
 
-    assert agent.session_id != original
-    assert "--session-id" in _argv_for(agent)
+    assert agent.session_id is None
+    assert "--resume" not in _argv_for(agent)
+
+
+def test_run_fresh_never_touches_the_session(tmp_path: Path) -> None:
+    """Proves a throwaway turn leaves the agent's own conversation alone."""
+    profile = tmp_path / "p.md"
+    profile.write_text("x", encoding="utf-8")
+    saved = "28aff200-76ed-4718-a98a-0d67857acbb5"
+    agent = Agent("a", profile, cwd=tmp_path, session_id=saved)
+
+    argv = agent._argv(continuity=False)
+
+    assert "--resume" not in argv
+    assert agent.session_id == saved
 
 
 def test_clean_context_controls_safe_mode(tmp_path: Path) -> None:
