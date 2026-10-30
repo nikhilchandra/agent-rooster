@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from functools import reduce
 from operator import or_
 from pathlib import Path
@@ -102,7 +104,6 @@ def test_session_continues_across_calls(workspace: Path, logs: Path, plain_profi
     # the agent could only know this from the earlier turn in the same session
     assert "41" in second["text"]
     assert second["session_id"] == first["session_id"]
-    assert len(agent.results) == 2
 
     # the cache is reported rather than asserted: a two-turn exchange can fall under the
     # minimum size the API will cache, so a zero here is not a failure of continuity
@@ -110,33 +111,31 @@ def test_session_continues_across_calls(workspace: Path, logs: Path, plain_profi
     print(f"total across both turns: {agent.total_tokens} tokens, ${agent.total_cost_usd:.4f}")
 
 
-def test_a_forked_question_remembers_without_moving_the_session(
-    workspace: Path, logs: Path, plain_profile: Path
-) -> None:
-    """Proves a forked turn sees the agent's memory and leaves its own session where it was."""
-    agent = Agent("memory", plain_profile, cwd=workspace, log_dir=logs, tools=Tool.NONE)
-    opening = agent.run("Remember the number 77. Reply with exactly: stored")
-    assert opening["ok"], opening["failure"]
-    before = agent.session_id
+def test_two_agents_run_at_the_same_time(workspace: Path, logs: Path, plain_profile: Path) -> None:
+    """Proves arun_fresh lets two agents work at once, so the second starts before the first
+    finishes."""
+    first = Agent("first", plain_profile, cwd=workspace, log_dir=logs, model=Model.HAIKU,
+                  tools=Tool.NONE)
+    second = Agent("second", plain_profile, cwd=workspace, log_dir=logs, model=Model.HAIKU,
+                   tools=Tool.NONE)
 
-    result = agent.run_forked("What number did I ask you to remember? Reply with just the number.")
+    async def timed(agent: Agent) -> tuple[float, float, dict]:
+        """Returns when the agent's turn started and ended, in seconds, and its result."""
+        start = time.monotonic()
+        result = await agent.arun_fresh("Reply with exactly: ok")
+        return start, time.monotonic(), result
 
-    assert result["ok"], result["failure"]
-    assert "77" in result["text"]
-    assert result["session_id"] != before
-    assert agent.session_id == before
+    async def both() -> list:
+        """Runs the two agents together."""
+        return await asyncio.gather(timed(first), timed(second))
 
+    (first_start, first_end, first_result), (second_start, _, second_result) = asyncio.run(both())
 
-def test_a_fork_with_nothing_to_fork_from_fails(
-    workspace: Path, logs: Path, plain_profile: Path
-) -> None:
-    """Proves forking an agent that has never run fails before any CLI call."""
-    agent = Agent("new", plain_profile, cwd=workspace, log_dir=logs, tools=Tool.NONE)
-
-    result = agent.run_forked("Anything.")
-
-    assert result["ok"] is False
-    assert agent.session_id is None
+    assert first_result["ok"], first_result["failure"]
+    assert second_result["ok"], second_result["failure"]
+    # a turn that blocked the event loop would let the second start only after the first ended
+    assert second_start < first_end
+    print(f"\nboth finished in {first_end - first_start:.1f}s of the first agent's time")
 
 
 def test_a_second_agent_object_resumes_the_first(
@@ -284,34 +283,3 @@ def test_a_command_runs_and_any_other_is_refused(
     assert "1 passed" in result["text"]
     assert any(d["tool_name"] == "Bash" for d in result["denials"])
     assert "42" not in result["text"]
-
-
-def test_transcript_holds_a_tool_call_and_its_result(
-    workspace: Path, logs: Path, plain_profile: Path
-) -> None:
-    """Proves the transcript records a tool call and the result that answered it."""
-    agent = Agent("shell", plain_profile, cwd=workspace, log_dir=logs, tools=Tool.BASH)
-
-    result = agent.run("Run `echo hi` with the Bash tool and report its output.")
-    assert result["ok"], result["failure"]
-
-    transcript = agent.transcript()
-    assert transcript
-
-    # collect the ids of every tool call, then of every result sent back for one
-    calls = {
-        block["id"]
-        for m in transcript
-        if m.type == "assistant" and isinstance(m.message["content"], list)
-        for block in m.message["content"]
-        if block.get("type") == "tool_use"
-    }
-    answered = {
-        block["tool_use_id"]
-        for m in transcript
-        if m.type == "user" and isinstance(m.message["content"], list)
-        for block in m.message["content"]
-        if block.get("type") == "tool_result"
-    }
-    assert calls, "no assistant message made a tool call"
-    assert calls & answered, "no tool call has a matching tool_result"

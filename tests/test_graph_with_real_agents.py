@@ -54,9 +54,9 @@ def test_hello_and_goodbye_alternate_until_the_round_count_is_met(tmp_path: Path
     assert run.data["rounds"] == ROUNDS
     assert run.data["transcript"] == ["Hello!", "Goodbye!"] * ROUNDS
 
-    # each agent kept one conversation across all five of its turns
-    assert len(hello.results) == ROUNDS
-    assert len(goodbye.results) == ROUNDS
+    # each agent wrote one log per turn, and kept one conversation across all of them
+    assert len(list(logs.glob("*-hello.log"))) == ROUNDS
+    assert len(list(logs.glob("*-goodbye.log"))) == ROUNDS
     assert run.sessions["hello"] == hello.session_id
     assert run.sessions["goodbye"] == goodbye.session_id
     assert hello.session_id != goodbye.session_id

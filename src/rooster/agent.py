@@ -16,9 +16,7 @@ from claude_agent_sdk import (
     ClaudeSDKError,
     CLINotFoundError,
     ResultMessage,
-    SessionMessage,
     get_session_info,
-    get_session_messages,
     query,
 )
 from pydantic import BaseModel, ValidationError
@@ -202,6 +200,11 @@ def _as_loggable(message: Any) -> dict:
 class Agent:
     """Holds one agent's identity and permissions, and runs it on demand.
 
+    run() and run_fresh() block until the turn ends. arun() and arun_fresh() do the same for
+    async callers, so several agents can run at once, as in
+    asyncio.gather(a.arun_fresh(p), b.arun_fresh(p)). One agent must not run two turns at
+    once, since both would share its one session.
+
     Every run method returns a result dict with these keys:
         ok: True when the turn completed and, given a schema, its reply fit the schema.
         text: The reply's text.
@@ -316,14 +319,9 @@ class Agent:
         # what lets a failed resume mean "expired" rather than "not created yet".
         self.session_id = session_id
 
-        self.results: list[dict] = []
+        # The cost in dollars and the tokens of every turn this agent has run.
         self.total_cost_usd = 0.0
         self.total_tokens = 0
-
-    @property
-    def last(self) -> dict | None:
-        """Returns the most recent result, or None if this agent has not run yet."""
-        return self.results[-1] if self.results else None
 
     def run(self, prompt: str) -> dict:
         """Runs a turn in this agent's own session, so it remembers its earlier turns.
@@ -379,59 +377,20 @@ class Agent:
         self._record(result)
         return result
 
-    def run_forked(self, prompt: str) -> dict:
-        """Runs arun_forked() synchronously, as run() does for arun().
-
-        Args:
-            prompt: The side question to ask.
-
-        Returns:
-            The turn's result dict, with the keys that the Agent class docstring lists.
-        """
-        return asyncio.run(self.arun_forked(prompt))
-
-    async def arun_forked(self, prompt: str) -> dict:
-        """Asks a side question against a copy of this agent's memory, without moving its
-        own session forward.
-
-        Requires a prior run() to fork from, and returns a failed result if there is none.
-        The forked session's id comes back in the result's "session_id" and is not kept.
-
-        Args:
-            prompt: The side question to ask.
-
-        Returns:
-            The turn's result dict, with the keys that the Agent class docstring lists.
-        """
-        if not self.session_id:
-            return self._failed("run_forked requires a prior run() to fork from")
-        result = await self._invoke(prompt, continuity=False, fork=True)
-        self._record(result)
-        return result
-
     def _record(self, result: dict) -> None:
-        """Files a result and adds its usage to this agent's running totals.
+        """Adds a finished turn's cost and tokens to this agent's running totals.
 
         Args:
             result: A finished turn's result dict.
         """
-        self.results.append(result)
         self.total_cost_usd += result["cost_usd"]
         self.total_tokens += result["total_tokens"]
 
-    def reset(self) -> None:
-        """Forgets the session so the next run starts a fresh conversation."""
-        self.session_id = None
-
-    def _options(
-        self, *, continuity: bool, fork: bool = False, stderr: list[str] | None = None
-    ) -> ClaudeAgentOptions:
+    def _options(self, *, continuity: bool, stderr: list[str] | None = None) -> ClaudeAgentOptions:
         """Assembles the SDK options for one turn.
 
         Args:
             continuity: True resumes this agent's session when it has one.
-            fork: True resumes a copy of this agent's session under a new id, and leaves the
-                session itself as it was.
             stderr: A list that collects the CLI's stderr lines. None discards them.
 
         Returns:
@@ -482,27 +441,12 @@ class Agent:
             max_budget_usd=self.max_work_usd,
             effort=str(self.effort) if self.effort is not None else None,
             # one rule, no state: rejoin a session we have, and let the CLI mint one when we do not
-            resume=self.session_id if (continuity or fork) and self.session_id else None,
-            fork_session=fork,
+            resume=self.session_id if continuity and self.session_id else None,
             cwd=self.cwd,
             cli_path=self.cli_path,
             extra_args=extra_args,
             stderr=stderr.append if stderr is not None else None,
         )
-
-    def _session_exists(self) -> bool:
-        """Answers whether the CLI still holds this agent's session on disk."""
-        return get_session_info(self.session_id, directory=str(self.cwd)) is not None
-
-    def transcript(self) -> list[SessionMessage]:
-        """Returns this agent's turn-by-turn transcript: every user/assistant message,
-        including tool calls and their results, in chronological order.
-
-        Returns an empty list if this agent has never run.
-        """
-        if self.session_id is None:
-            return []
-        return get_session_messages(self.session_id, directory=str(self.cwd))
 
     def _open_log(self, options: ClaudeAgentOptions) -> tuple[Path, IO[str]]:
         """Creates this turn's log file and writes the options it runs with.
@@ -562,31 +506,16 @@ class Agent:
         result.update(extra)
         return result
 
-    def _expired(self, log_path: Path | None = None) -> dict:
-        """Builds the result for a turn whose session has expired or been deleted.
-
-        The turn is never retried on a fresh session. A prompt written for an agent that
-        remembers is meaningless to one that does not, and it would answer anyway.
-
-        Args:
-            log_path: The turn's log file, or None when the turn never started.
-
-        Returns:
-            A failed result dict whose "session_expired" is True.
-        """
-        return self._failed(
-            f"the session {self.session_id} has expired or was deleted",
-            log_path,
-            session_expired=True,
-        )
-
-    async def _invoke(self, prompt: str, *, continuity: bool, fork: bool = False) -> dict:
+    async def _invoke(self, prompt: str, *, continuity: bool) -> dict:
         """Runs the CLI once through the SDK and turns whatever came back into a result.
+
+        A turn whose session has expired is never retried on a fresh session. A prompt
+        written for an agent that remembers is meaningless to one that does not, and it
+        would answer anyway.
 
         Args:
             prompt: The message to send.
             continuity: True resumes this agent's session when it has one.
-            fork: True resumes a copy of this agent's session instead.
 
         Returns:
             The turn's result dict, with the keys that the Agent class docstring lists.
@@ -594,13 +523,18 @@ class Agent:
         Raises:
             AgentError: The claude CLI cannot be found.
         """
+        expired = f"the session {self.session_id} has expired or was deleted"
         # a session that is gone costs nothing to discover, so check before spawning anything
-        if (continuity or fork) and self.session_id and not self._session_exists():
-            return self._expired()
+        if (
+            continuity
+            and self.session_id
+            and get_session_info(self.session_id, directory=str(self.cwd)) is None
+        ):
+            return self._failed(expired, session_expired=True)
 
         stderr: list[str] = []
         messages: list[Any] = []
-        options = self._options(continuity=continuity, fork=fork, stderr=stderr)
+        options = self._options(continuity=continuity, stderr=stderr)
         error: str | None = None
         log_path, log = self._open_log(options)
 
@@ -630,7 +564,7 @@ class Agent:
             return self._parse(final, log_path)
         # backstop for a session that vanished between the check above and the spawn
         if continuity and any("No conversation found with session ID" in line for line in stderr):
-            return self._expired(log_path)
+            return self._failed(expired, log_path, session_expired=True)
         return self._failed(error or "the CLI produced no result", log_path)
 
     def _parse(self, message: ResultMessage, log_path: Path | None) -> dict:

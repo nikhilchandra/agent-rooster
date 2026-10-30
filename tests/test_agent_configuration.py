@@ -262,21 +262,6 @@ def test_an_agent_holding_an_id_always_resumes(make) -> None:
     assert options.session_id is None
 
 
-def test_reset_forgets_the_session(make) -> None:
-    """Proves reset abandons the conversation without discarding the result history."""
-    agent = make(session_id="something")
-
-    agent.reset()
-
-    assert agent.session_id is None
-    assert _options_for(agent).resume is None
-
-
-def test_a_new_agent_has_an_empty_transcript(make) -> None:
-    """Proves an agent that has never run returns an empty transcript."""
-    assert make().transcript() == []
-
-
 def test_run_fresh_never_touches_the_session(make) -> None:
     """Proves a throwaway turn leaves the agent's own conversation alone."""
     saved = "28aff200-76ed-4718-a98a-0d67857acbb5"
@@ -286,16 +271,6 @@ def test_run_fresh_never_touches_the_session(make) -> None:
 
     assert options.resume is None
     assert agent.session_id == saved
-
-
-def test_a_fork_resumes_a_copy_of_the_session(make) -> None:
-    """Proves a forked turn resumes this agent's session and asks the CLI to copy it."""
-    saved = "28aff200-76ed-4718-a98a-0d67857acbb5"
-
-    options = make(session_id=saved)._options(continuity=False, fork=True)
-
-    assert options.resume == saved
-    assert options.fork_session is True
 
 
 def test_safe_mode_controls_the_flag(make) -> None:
