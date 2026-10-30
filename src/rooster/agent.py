@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+from collections.abc import Callable
 from contextlib import aclosing
 from datetime import datetime, timezone
 from enum import Flag, StrEnum, auto
@@ -158,11 +159,17 @@ class Agent:
         log_dir: Path | None = None,
         session_id: str | None = None,
         cli_path: Path | None = None,
+        on_message: Callable[[Any], None] | None = None,
     ) -> None:
         """Validates the configuration and adopts any session id handed in.
 
         A 'cli_path' of None lets the SDK find the CLI, first in its own bundled copy and then
         on PATH. A missing CLI is only discovered on the first run, where it raises AgentError.
+
+        Given 'on_message', every turn calls it with each raw SDK message as the stream yields
+        it, such as an AssistantMessage or the final ResultMessage. It is called synchronously
+        and never awaited, so it must not be a coroutine function. Any exception it raises is
+        ignored, and the turn's result is unaffected.
         """
         # a bad profile path is a caller mistake, so fail before spawning anything
         if not profile.is_file():
@@ -186,6 +193,7 @@ class Agent:
         self.clean_context = clean_context
         self.log_dir = log_dir
         self.cli_path = cli_path
+        self.on_message = on_message
 
         # The CLI mints the id and reports it on the first reply. So None means this agent
         # has never run, and an id can only have come from a call that completed, which is
@@ -390,6 +398,11 @@ class Agent:
                 async with aclosing(query(prompt=prompt, options=options)) as stream:
                     async for message in stream:
                         messages.append(message)
+                        if self.on_message is not None:
+                            try:
+                                self.on_message(message)
+                            except Exception:
+                                pass
         except TimeoutError:
             error = f"timed out after {self.timeout_s}s"
         except CLINotFoundError as exc:

@@ -8,6 +8,7 @@ from operator import or_
 from pathlib import Path
 
 import pytest
+from claude_agent_sdk import ResultMessage
 
 from rooster import Agent, Model, Tool
 from rooster.agent import _ALIASES, _CLI_NAMES
@@ -237,6 +238,29 @@ def test_a_timeout_is_reported_as_a_failure(workspace: Path, plain_profile: Path
 
     assert result["ok"] is False
     assert "timed out" in result["failure"]
+
+
+def test_on_message_sees_each_message(workspace: Path, plain_profile: Path) -> None:
+    """Proves the observer receives the turn's raw SDK messages, including its ResultMessage."""
+    seen: list = []
+    agent = Agent("watched", plain_profile, cwd=workspace, allowed_tools=Tool.NONE,
+                  on_message=seen.append)
+
+    result = agent.run("Reply with exactly: ok")
+
+    assert result["ok"], result["failure"]
+    assert seen
+    assert any(isinstance(m, ResultMessage) for m in seen)
+
+
+def test_a_raising_observer_leaves_the_result_intact(workspace: Path, plain_profile: Path) -> None:
+    """Proves an observer that raises on every message cannot fail the turn."""
+    agent = Agent("watched", plain_profile, cwd=workspace, allowed_tools=Tool.NONE,
+                  on_message=lambda m: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    result = agent.run("Reply with exactly: ok")
+
+    assert result["ok"] is True, result["failure"]
 
 
 def test_transcript_holds_a_tool_call_and_its_result(workspace: Path, plain_profile: Path) -> None:
