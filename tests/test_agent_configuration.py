@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from claude_agent_sdk import ClaudeAgentOptions
 
-from rooster import Agent, AgentError, Model, PermissionMode, Tool
+from rooster import Agent, AgentError, Effort, Model, PermissionMode, Tool
 from rooster.agent import _CLI_NAMES, _cli_names
 
 
@@ -75,6 +75,7 @@ def test_enums_are_their_cli_strings() -> None:
     """Proves an enum member needs no conversion on the command line."""
     assert str(Model.SONNET) == "sonnet"
     assert str(PermissionMode.ACCEPT_EDITS) == "acceptEdits"
+    assert str(Effort.HIGH) == "high"
 
 
 def _options_for(agent: Agent) -> ClaudeAgentOptions:
@@ -228,6 +229,36 @@ def test_clean_context_controls_safe_mode(tmp_path: Path) -> None:
     assert "safe-mode" not in _options_for(
         Agent("a", profile, cwd=tmp_path, clean_context=False)
     ).extra_args
+
+
+def test_effort_reaches_the_options(tmp_path: Path) -> None:
+    """Proves an effort level is passed to the SDK as its CLI string."""
+    profile = tmp_path / "p.md"
+    profile.write_text("x", encoding="utf-8")
+
+    options = _options_for(Agent("a", profile, cwd=tmp_path, effort=Effort.HIGH))
+
+    assert options.effort == "high"
+
+
+def test_max_turns_reaches_the_options(tmp_path: Path) -> None:
+    """Proves a turn limit is passed to the SDK unchanged."""
+    profile = tmp_path / "p.md"
+    profile.write_text("x", encoding="utf-8")
+
+    options = _options_for(Agent("a", profile, cwd=tmp_path, max_turns=5))
+
+    assert options.max_turns == 5
+
+
+def test_fallback_model_reaches_the_options(tmp_path: Path) -> None:
+    """Proves a fallback model is passed to the SDK unchanged."""
+    profile = tmp_path / "p.md"
+    profile.write_text("x", encoding="utf-8")
+
+    options = _options_for(Agent("a", profile, cwd=tmp_path, fallback_model="claude-haiku-4-5"))
+
+    assert options.fallback_model == "claude-haiku-4-5"
 
 
 def test_an_unknown_session_is_expired_without_running(tmp_path: Path) -> None:

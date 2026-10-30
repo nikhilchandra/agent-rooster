@@ -85,6 +85,16 @@ class Model(StrEnum):
     FABLE = "fable"
 
 
+class Effort(StrEnum):
+    """Names the effort levels the CLI accepts, from least to most thorough."""
+
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    XHIGH = "xhigh"
+    MAX = "max"
+
+
 # Maps each single-bit Tool to the name the CLI knows it by. This is a subset of the tools
 # listed at https://code.claude.com/docs/en/tools-reference, and any other tool can still be
 # allowed by name through extra_allowed_tools.
@@ -154,6 +164,9 @@ class Agent:
         schema: dict | None = None,
         max_work_usd: float | None = None,
         timeout_s: int | None = None,
+        effort: Effort | str | None = None,
+        max_turns: int | None = None,
+        fallback_model: str | None = None,
         clean_context: bool = True,
         log_dir: Path | None = None,
         session_id: str | None = None,
@@ -183,6 +196,9 @@ class Agent:
         self.schema = schema
         self.max_work_usd = max_work_usd
         self.timeout_s = timeout_s
+        self.effort = effort
+        self.max_turns = max_turns
+        self.fallback_model = fallback_model
         self.clean_context = clean_context
         self.log_dir = log_dir
         self.cli_path = cli_path
@@ -294,6 +310,9 @@ class Agent:
                 {"type": "json_schema", "schema": self.schema} if self.schema is not None else None
             ),
             max_budget_usd=self.max_work_usd,
+            effort=str(self.effort) if self.effort is not None else None,
+            max_turns=self.max_turns,
+            fallback_model=self.fallback_model,
             # one rule, no state: rejoin a session we have, and let the CLI mint one when we do not
             resume=self.session_id if (continuity or fork) and self.session_id else None,
             fork_session=fork,
