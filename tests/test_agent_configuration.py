@@ -134,6 +134,55 @@ def test_a_pattern_rule_makes_its_tool_available(tmp_path: Path) -> None:
     assert "Bash" not in options.allowed_tools
 
 
+def test_a_permission_policy_becomes_can_use_tool(tmp_path: Path) -> None:
+    """Proves a permission_policy is handed to the SDK as its can_use_tool callback."""
+    profile = tmp_path / "p.md"
+    profile.write_text("x", encoding="utf-8")
+    agent = Agent("a", profile, cwd=tmp_path, permission_policy=lambda name, args: True)
+
+    assert _options_for(agent).can_use_tool is not None
+
+
+def test_a_permission_policy_pre_approves_no_builtin_tool(tmp_path: Path) -> None:
+    """Proves a policy leaves the built-in tools available but unapproved, so the policy
+    decides every call to them."""
+    profile = tmp_path / "p.md"
+    profile.write_text("x", encoding="utf-8")
+    agent = Agent("a", profile, cwd=tmp_path, allowed_tools=Tool.BASH | Tool.READ,
+                  extra_allowed_tools=("Bash(git *)",),
+                  permission_policy=lambda name, args: True)
+
+    options = _options_for(agent)
+
+    assert set(options.tools) == {"Bash", "Read"}
+    assert options.allowed_tools == ["Bash(git *)"]
+    # --permission-prompts none would deny each call before the policy is asked
+    assert "permission-prompts" not in options.extra_args
+
+
+def test_no_permission_policy_leaves_the_allowlist_alone(tmp_path: Path) -> None:
+    """Proves an agent without a policy still pre-approves its built-in tools."""
+    profile = tmp_path / "p.md"
+    profile.write_text("x", encoding="utf-8")
+    agent = Agent("a", profile, cwd=tmp_path, allowed_tools=Tool.BASH | Tool.READ)
+
+    options = _options_for(agent)
+
+    assert options.can_use_tool is None
+    assert set(options.tools) == {"Bash", "Read"}
+    assert set(options.allowed_tools) == {"Bash", "Read"}
+    assert options.extra_args["permission-prompts"] == "none"
+
+
+def test_a_permission_policy_with_bypass_mode_raises(tmp_path: Path) -> None:
+    """Proves a policy that bypass mode would never consult fails at construction."""
+    profile = tmp_path / "p.md"
+    profile.write_text("x", encoding="utf-8")
+    with pytest.raises(AgentError, match="BYPASS"):
+        Agent("a", profile, cwd=tmp_path, permission_mode=PermissionMode.BYPASS,
+              permission_policy=lambda name, args: True)
+
+
 def test_profile_is_appended_to_the_claude_code_prompt(tmp_path: Path) -> None:
     """Proves the profile adds to Claude Code's system prompt rather than replacing it."""
     profile = tmp_path / "p.md"

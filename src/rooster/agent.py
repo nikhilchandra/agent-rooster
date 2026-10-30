@@ -9,14 +9,17 @@ from contextlib import aclosing
 from datetime import datetime, timezone
 from enum import Flag, StrEnum, auto
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKError,
     CLINotFoundError,
+    PermissionResultAllow,
+    PermissionResultDeny,
     ResultMessage,
     SessionMessage,
+    ToolPermissionContext,
     get_session_info,
     get_session_messages,
     query,
@@ -158,11 +161,21 @@ class Agent:
         log_dir: Path | None = None,
         session_id: str | None = None,
         cli_path: Path | None = None,
+        permission_policy: Callable[[str, dict], bool | tuple[bool, str]] | None = None,
     ) -> None:
         """Validates the configuration and adopts any session id handed in.
 
         A 'cli_path' of None lets the SDK find the CLI, first in its own bundled copy and then
         on PATH. A missing CLI is only discovered on the first run, where it raises AgentError.
+
+        Given a 'permission_policy', each tool call is passed to it as the tool's name and its
+        input dict. The call runs if the policy returns True or (True, reason), and is refused
+        if it returns False or (False, reason), with the refusal listed in the result's
+        "denials". The built-in tools that 'allowed_tools' names are then made available
+        without being approved in advance, so the policy sees every call to them. A bare tool
+        name in 'extra_allowed_tools', such as "Bash" rather than "Bash(git *)", is still
+        approved before the policy is asked, and so is a Bash command that the CLI treats as
+        read-only, such as `echo hi`.
         """
         # a bad profile path is a caller mistake, so fail before spawning anything
         if not profile.is_file():
@@ -172,6 +185,11 @@ class Agent:
             )
         if cli_path is not None and not Path(cli_path).is_file():
             raise AgentError(f"agent {name!r}: no claude executable at {cli_path}.")
+        if permission_policy is not None and str(permission_mode) == str(PermissionMode.BYPASS):
+            raise AgentError(
+                f"agent {name!r}: permission_policy cannot be combined with "
+                "PermissionMode.BYPASS, which skips the policy entirely."
+            )
 
         self.name = name
         self.profile = profile
@@ -186,6 +204,7 @@ class Agent:
         self.clean_context = clean_context
         self.log_dir = log_dir
         self.cli_path = cli_path
+        self.permission_policy = permission_policy
 
         # The CLI mints the id and reports it on the first reply. So None means this agent
         # has never run, and an id can only have come from a call that completed, which is
@@ -281,6 +300,25 @@ class Agent:
         if self.clean_context:
             extra_args["safe-mode"] = None
 
+        pre_approved = builtin
+        can_use_tool = None
+        if self.permission_policy is not None:
+            policy = self.permission_policy
+            # a bare name in allowed_tools is approved before can_use_tool is asked, so leave
+            # the built-in names out and let the policy decide every call to them
+            pre_approved = []
+            # drop the flag that denies every prompt, since the policy is what answers them now
+            del extra_args["permission-prompts"]
+
+            async def can_use_tool(
+                tool_name: str, tool_input: dict, context: ToolPermissionContext
+            ) -> PermissionResultAllow | PermissionResultDeny:
+                verdict = policy(tool_name, tool_input)
+                allowed, reason = verdict if isinstance(verdict, tuple) else (verdict, None)
+                if allowed:
+                    return PermissionResultAllow()
+                return PermissionResultDeny(message=reason or "denied by permission_policy")
+
         return ClaudeAgentOptions(
             model=str(self.model),
             permission_mode=str(self.permission_mode),
@@ -289,7 +327,8 @@ class Agent:
             system_prompt={"type": "preset", "preset": "claude_code"},
             # tools sets what exists at all, so an empty list really does mean no tools
             tools=available,
-            allowed_tools=builtin + list(self.extra_allowed_tools),
+            allowed_tools=pre_approved + list(self.extra_allowed_tools),
+            can_use_tool=can_use_tool,
             output_format=(
                 {"type": "json_schema", "schema": self.schema} if self.schema is not None else None
             ),
