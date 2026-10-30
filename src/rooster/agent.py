@@ -422,14 +422,15 @@ class Agent:
             stderr=stderr.append if stderr is not None else None,
         )
 
-    def _open_log(self, options: ClaudeAgentOptions) -> tuple[Path, IO[str]]:
-        """Creates this turn's log file and writes the options it runs with.
+    def _open_log(self, options: ClaudeAgentOptions, prompt: str) -> tuple[Path, IO[str]]:
+        """Creates this turn's log file and writes the options and the prompt it runs with.
 
-        The file has three sections: the options, then one JSON line per SDK message as it
-        arrives, then the CLI's stderr once the turn ends.
+        The file has four sections: the options, the prompt exactly as sent, then one JSON
+        line per SDK message as it arrives, then the CLI's stderr once the turn ends.
 
         Args:
             options: The options that the turn runs with.
+            prompt: The message that the turn sends.
 
         Returns:
             The log file's path, and the file opened for the messages that follow.
@@ -444,6 +445,8 @@ class Agent:
         }
         log = path.open("w", encoding="utf-8")
         log.write("--- options ---\n" + json.dumps(settings, indent=2, default=str) + "\n\n")
+        # the SDK never echoes the prompt back among the messages, so this is its only record
+        log.write("--- prompt ---\n" + prompt + "\n\n")
         log.write("--- messages ---\n")
         log.flush()
         return path, log
@@ -509,7 +512,7 @@ class Agent:
         messages: list[Any] = []
         options = self._options(stderr=stderr)
         error: str | None = None
-        log_path, log = self._open_log(options)
+        log_path, log = self._open_log(options, prompt)
 
         try:
             async with asyncio.timeout(self.timeout_s):

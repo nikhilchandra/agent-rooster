@@ -313,8 +313,25 @@ def test_each_message_is_logged_as_it_arrives(make, tmp_path: Path, monkeypatch)
 
     assert '"result": "first"' in seen_in_log[0]
     log = result["log_path"].read_text(encoding="utf-8")
-    assert log.index("--- options ---") < log.index("--- messages ---") < log.index("--- stderr ---")
+    assert log.index("--- options ---") < log.index("--- prompt ---") < log.index("--- messages ---")
+    assert log.index("--- messages ---") < log.index("--- stderr ---")
     assert '"result": "second"' in log
+
+
+def test_the_prompt_is_logged_exactly(make, monkeypatch) -> None:
+    """Proves the log holds the prompt as sent, on lines of its own, since the SDK never
+    echoes it back among the messages."""
+    prompt = "Review this diff.\n\nIt has two paragraphs, and an accent: café."
+
+    async def fake_query(prompt, options):
+        yield _result()
+
+    monkeypatch.setattr("rooster.agent.query", fake_query)
+    result = make().run(prompt)
+
+    log = result["log_path"].read_text(encoding="utf-8")
+    section = log.split("--- prompt ---\n", 1)[1].split("\n\n--- messages ---", 1)[0]
+    assert section == prompt
 
 
 def test_an_unknown_session_is_expired_without_running(make, tmp_path: Path) -> None:
