@@ -194,6 +194,19 @@ def test_a_new_agent_has_an_empty_transcript(tmp_path: Path) -> None:
     assert agent.transcript() == []
 
 
+def test_on_message_is_stored(tmp_path: Path) -> None:
+    """Proves the observer handed to the constructor is the one the agent keeps."""
+    profile = tmp_path / "p.md"
+    profile.write_text("x", encoding="utf-8")
+
+    def observe(message: object) -> None:
+        pass
+
+    agent = Agent("a", profile, cwd=tmp_path, on_message=observe)
+
+    assert agent.on_message is observe
+
+
 def test_run_fresh_never_touches_the_session(tmp_path: Path) -> None:
     """Proves a throwaway turn leaves the agent's own conversation alone."""
     profile = tmp_path / "p.md"
