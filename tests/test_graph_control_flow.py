@@ -12,8 +12,9 @@ from rooster import AgentGraph, GraphError, Run
 class FakeAgent:
     """Stands in for Agent, recording what it was asked and inventing a session id."""
 
-    def __init__(self, name: str, session_id: str | None = None) -> None:
+    def __init__(self, name: str, cwd: Path, session_id: str | None = None) -> None:
         self.name = name
+        self.cwd = cwd
         self.session_id = session_id
         self.prompts: list[str] = []
         self.total_cost_usd = 0.0
@@ -31,7 +32,7 @@ class FakeAgent:
 @pytest.fixture
 def graph(tmp_path: Path) -> AgentGraph:
     """Builds a two-step graph with a gate between the steps."""
-    agents = {"writer": FakeAgent("writer"), "tester": FakeAgent("tester")}
+    agents = {"writer": FakeAgent("writer", tmp_path), "tester": FakeAgent("tester", tmp_path)}
     g = AgentGraph("bdd", agents, start="write", state_dir=tmp_path / ".rooster")
 
     @g.step("write", gate=True)
@@ -81,6 +82,48 @@ def test_session_ids_are_saved_and_handed_back(graph: AgentGraph, tmp_path: Path
     graph.resume(started.slug)
 
     assert graph.agents["writer"].session_id == "session-for-writer"
+
+
+def test_sessions_are_tagged_with_their_run(
+    graph: AgentGraph, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Proves each agent's session is tagged with the graph and run it belongs to."""
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        "rooster.graph.tag_session",
+        lambda session_id, tag, directory=None: calls.append((session_id, tag, directory)),
+    )
+
+    started = graph.start("a feature")
+
+    tag = f"rooster:bdd/{started.slug}"
+    assert calls == [("session-for-writer", tag, str(tmp_path))]
+
+    # the next step tags the writer again and the tester for the first time
+    calls.clear()
+    finished = graph.resume(started.slug)
+
+    assert finished.status == "done"
+    assert ("session-for-writer", tag, str(tmp_path)) in calls
+    assert ("session-for-tester", tag, str(tmp_path)) in calls
+
+
+def test_a_session_that_cannot_be_tagged_does_not_fail_the_run(
+    graph: AgentGraph, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Proves a missing session file leaves the run to gate and finish as usual."""
+
+    def missing(session_id: str, tag: str, directory: str | None = None) -> None:
+        raise FileNotFoundError(session_id)
+
+    monkeypatch.setattr("rooster.graph.tag_session", missing)
+
+    started = graph.start("a feature")
+    assert started.waiting
+
+    finished = graph.resume(started.slug)
+    assert finished.status == "done"
+    assert finished.failure is None
 
 
 def test_state_survives_a_new_graph_object(graph: AgentGraph, tmp_path: Path) -> None:

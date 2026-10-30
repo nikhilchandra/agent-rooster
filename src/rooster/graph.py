@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from claude_agent_sdk import tag_session
+
 from rooster.agent import Agent
 
 
@@ -188,6 +190,17 @@ class AgentGraph:
         for name, agent in self.agents.items():
             if agent.session_id:
                 run.sessions[name] = agent.session_id
+                # tag the session with its graph and run, so it can be traced back from
+                # Claude Code's session list. a session that cannot be tagged is skipped,
+                # since the tag is only for a human browsing sessions
+                try:
+                    tag_session(
+                        agent.session_id,
+                        f"rooster:{self.name}/{run.slug}",
+                        directory=str(agent.cwd),
+                    )
+                except (ValueError, FileNotFoundError):
+                    pass
         run.cost_usd = sum(a.total_cost_usd for a in self.agents.values())
         run.tokens = sum(a.total_tokens for a in self.agents.values())
 
