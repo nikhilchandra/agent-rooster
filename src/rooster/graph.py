@@ -70,10 +70,21 @@ class AgentGraph:
         agents: dict[str, Agent],
         start: str,
         *,
-        state_dir: Path = Path(".rooster"),
+        state_dir: Path,
         max_steps: int = 100,
     ) -> None:
-        """Registers the agents and decides where this graph's runs are stored."""
+        """Registers the agents and decides where this graph's runs are stored.
+
+        Args:
+            name: The graph's name. Its runs are stored under 'state_dir' in a folder of
+                this name.
+            agents: The agents that the steps call, keyed by the name a run saves their
+                sessions under.
+            start: The name of the step that every run begins with.
+            state_dir: The folder of the project using rooster, such as <cwd>/.rooster.
+            max_steps: The most steps that one start or resume may take before the run
+                halts.
+        """
         self.name = name
         self.agents = agents
         self.start_step = start
