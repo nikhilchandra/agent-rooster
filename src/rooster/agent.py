@@ -112,7 +112,6 @@ class Agent:
         cwd: Path,
         model: Model | str = Model.SONNET,
         allowed_tools: Tool = Tool.INSPECT,
-        denied_tools: Tool = Tool.NONE,
         extra_allowed_tools: tuple[str, ...] = (),
         permission_mode: PermissionMode | str = PermissionMode.ACCEPT_EDITS,
         schema: dict | None = None,
@@ -142,7 +141,6 @@ class Agent:
         self.cwd = cwd
         self.model = model
         self.allowed_tools = allowed_tools
-        self.denied_tools = denied_tools
         self.extra_allowed_tools = extra_allowed_tools
         self.permission_mode = permission_mode
         self.schema = schema
@@ -232,7 +230,6 @@ class Agent:
             # tools sets what exists at all, so an empty list really does mean no tools
             tools=available,
             allowed_tools=builtin + list(self.extra_allowed_tools),
-            disallowed_tools=_cli_names(self.denied_tools),
             output_format=(
                 {"type": "json_schema", "schema": self.schema} if self.schema is not None else None
             ),
