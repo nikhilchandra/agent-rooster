@@ -9,7 +9,7 @@ import pytest
 from claude_agent_sdk import ClaudeAgentOptions
 
 from rooster import Agent, AgentError, Model, PermissionMode, Tool
-from rooster.agent import _CLI_NAMES
+from rooster.agent import _CLI_NAMES, _cli_names
 
 
 def test_missing_profile_raises(tmp_path: Path) -> None:
@@ -34,20 +34,28 @@ def test_tool_flags_compose() -> None:
     assert Tool.BASH not in (Tool.FULL & ~Tool.BASH)
 
 
-def test_every_tool_has_a_cli_name_and_full_holds_them_all() -> None:
-    """Proves no single tool is left without a CLI name, and that Tool.FULL grants each one."""
+def test_every_tool_has_its_own_cli_name() -> None:
+    """Proves each single tool has a CLI name, and that no two of them share one."""
     # the single-bit members, skipping NONE, the composites and any alias of an earlier member
     singles = {
         member
         for member in Tool.__members__.values()
         if member.value and member.value & (member.value - 1) == 0
     }
-    assert singles <= _CLI_NAMES.keys(), singles - _CLI_NAMES.keys()
+    assert singles == _CLI_NAMES.keys()
+    assert len(set(_CLI_NAMES.values())) == len(_CLI_NAMES)
 
-    every = Tool.NONE
-    for member in singles:
-        every |= member
-    assert Tool.FULL == every
+
+def test_full_holds_only_the_core_tools() -> None:
+    """Proves the tools that only some setups need stay out of Tool.FULL."""
+    assert set(_cli_names(Tool.FULL)) == {
+        "Read", "Write", "Edit", "Bash", "Glob", "Grep", "Agent", "WebFetch", "WebSearch",
+    }
+
+
+def test_tasks_expands_to_the_four_task_tools() -> None:
+    """Proves Tool.TASKS asks for the four tools that track a task list."""
+    assert set(_cli_names(Tool.TASKS)) == {"TaskCreate", "TaskGet", "TaskList", "TaskUpdate"}
 
 
 def test_full_asks_for_agent_and_no_retired_name(tmp_path: Path) -> None:

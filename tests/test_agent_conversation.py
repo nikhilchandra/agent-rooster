@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+from functools import reduce
+from operator import or_
 from pathlib import Path
 
 import pytest
@@ -11,6 +13,9 @@ from rooster import Agent, Model, Tool
 from rooster.agent import _ALIASES, _CLI_NAMES
 
 pytestmark = pytest.mark.live
+
+# tools that only start once a plugin or an MCP server is configured
+NEEDS_SETUP = {"LSP", "ListMcpResourcesTool", "ReadMcpResourceTool"}
 
 
 @pytest.fixture
@@ -168,15 +173,16 @@ def test_a_prompt_longer_than_the_windows_command_line_works(
     assert result["text"].strip() == "ok"
 
 
-def test_full_provides_every_named_tool(workspace: Path, plain_profile: Path) -> None:
-    """Proves the CLI starts with every tool that Tool.FULL names, so none is silently
-    dropped as a name the CLI no longer knows."""
+def test_the_cli_provides_every_named_tool(workspace: Path, plain_profile: Path) -> None:
+    """Proves the CLI starts with every tool that _CLI_NAMES names, apart from the ones that
+    need a plugin or an MCP server, so none is silently dropped as a name the CLI no longer
+    knows."""
     agent = Agent(
-        "full",
+        "every",
         plain_profile,
         cwd=workspace,
         model=Model.HAIKU,
-        allowed_tools=Tool.FULL,
+        allowed_tools=reduce(or_, _CLI_NAMES),
         log_dir=workspace / "logs",
     )
 
@@ -193,7 +199,7 @@ def test_full_provides_every_named_tool(workspace: Path, plain_profile: Path) ->
         m for m in messages if m["type"] == "SystemMessage" and m.get("subtype") == "init"
     )
     started = {_ALIASES.get(name, name) for name in init["data"]["tools"]}
-    missing = set(_CLI_NAMES.values()) - started
+    missing = set(_CLI_NAMES.values()) - NEEDS_SETUP - started
     assert not missing, f"the CLI did not start with {sorted(missing)}"
 
 

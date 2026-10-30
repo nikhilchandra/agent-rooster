@@ -40,10 +40,27 @@ class Tool(Flag):
     WEB_FETCH = auto()
     WEB_SEARCH = auto()
 
+    # these suit only some setups, so no composite below includes them
+    NOTEBOOK_EDIT = auto()
+    POWERSHELL = auto()
+    TASK_CREATE = auto()
+    TASK_GET = auto()
+    TASK_LIST = auto()
+    TASK_UPDATE = auto()
+    TASK_STOP = auto()
+    SKILL = auto()
+    LIST_MCP_RESOURCES = auto()
+    READ_MCP_RESOURCE = auto()
+    LSP = auto()
+    ENTER_WORKTREE = auto()
+    EXIT_WORKTREE = auto()
+    MONITOR = auto()
+
     # composites, so a caller writes the intent rather than assembling it every time
     INSPECT = READ | GLOB | GREP
     AUTHOR = READ | GLOB | GREP | WRITE | EDIT
     FULL = READ | GLOB | GREP | WRITE | EDIT | BASH | AGENT | WEB_FETCH | WEB_SEARCH
+    TASKS = TASK_CREATE | TASK_GET | TASK_LIST | TASK_UPDATE
 
 
 class PermissionMode(StrEnum):
@@ -66,7 +83,9 @@ class Model(StrEnum):
     FABLE = "fable"
 
 
-# maps each single-bit Tool to the name the CLI knows it by
+# Maps each single-bit Tool to the name the CLI knows it by. This is a subset of the tools
+# listed at https://code.claude.com/docs/en/tools-reference, and any other tool can still be
+# allowed by name through extra_allowed_tools.
 _CLI_NAMES: dict[Tool, str] = {
     Tool.READ: "Read",
     Tool.WRITE: "Write",
@@ -77,6 +96,20 @@ _CLI_NAMES: dict[Tool, str] = {
     Tool.AGENT: "Agent",
     Tool.WEB_FETCH: "WebFetch",
     Tool.WEB_SEARCH: "WebSearch",
+    Tool.NOTEBOOK_EDIT: "NotebookEdit",
+    Tool.POWERSHELL: "PowerShell",
+    Tool.TASK_CREATE: "TaskCreate",
+    Tool.TASK_GET: "TaskGet",
+    Tool.TASK_LIST: "TaskList",
+    Tool.TASK_UPDATE: "TaskUpdate",
+    Tool.TASK_STOP: "TaskStop",
+    Tool.SKILL: "Skill",
+    Tool.LIST_MCP_RESOURCES: "ListMcpResourcesTool",
+    Tool.READ_MCP_RESOURCE: "ReadMcpResourceTool",
+    Tool.LSP: "LSP",
+    Tool.ENTER_WORKTREE: "EnterWorktree",
+    Tool.EXIT_WORKTREE: "ExitWorktree",
+    Tool.MONITOR: "Monitor",
 }
 
 # maps an old name that the CLI's init message may still report to the name in _CLI_NAMES
