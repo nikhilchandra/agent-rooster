@@ -1,13 +1,24 @@
-"""Runs one Claude Code agent as a subprocess and returns its answer as data."""
+"""Runs one Claude Code agent through the Agent SDK and returns its answer as data."""
 
 from __future__ import annotations
 
+import asyncio
+import dataclasses
 import json
-import shutil
-import subprocess
+from contextlib import aclosing
 from datetime import datetime, timezone
 from enum import Flag, StrEnum, auto
 from pathlib import Path
+from typing import Any
+
+from claude_agent_sdk import (
+    ClaudeAgentOptions,
+    ClaudeSDKError,
+    CLINotFoundError,
+    ResultMessage,
+    get_session_info,
+    query,
+)
 
 
 class AgentError(RuntimeError):
@@ -76,6 +87,20 @@ def _cli_names(tools: Tool) -> list[str]:
     return [_CLI_NAMES[bit] for bit in tools if bit in _CLI_NAMES]
 
 
+def _builtin_of(rule: str) -> str | None:
+    """Returns the built-in tool that a permission rule such as "Bash(git *)" refers to, or
+    None for an MCP tool, which the CLI's list of available tools does not govern."""
+    if rule.startswith("mcp__"):
+        return None
+    return rule.split("(", 1)[0]
+
+
+def _as_loggable(message: Any) -> dict:
+    """Returns an SDK message as a dict that json.dumps can write."""
+    body = dataclasses.asdict(message) if dataclasses.is_dataclass(message) else {"repr": repr(message)}
+    return {"type": type(message).__name__, **body}
+
+
 class Agent:
     """Holds one agent's identity and permissions, and runs it on demand."""
 
@@ -96,20 +121,21 @@ class Agent:
         clean_context: bool = True,
         log_dir: Path | None = None,
         session_id: str | None = None,
+        cli_path: Path | None = None,
     ) -> None:
-        """Validates the configuration and mints this agent's session id."""
-        # a bad profile path or a missing binary is a caller mistake, so fail before spawning anything
+        """Validates the configuration and adopts any session id handed in.
+
+        A 'cli_path' of None lets the SDK find the CLI, first in its own bundled copy and then
+        on PATH. A missing CLI is only discovered on the first run, where it raises AgentError.
+        """
+        # a bad profile path is a caller mistake, so fail before spawning anything
         if not profile.is_file():
             raise AgentError(
                 f"agent {name!r}: no profile at {profile}. "
                 "profile must be a markdown file holding the agent's instructions."
             )
-        exe = shutil.which("claude")
-        if exe is None:
-            raise AgentError(
-                f"agent {name!r}: the 'claude' executable is not on PATH. "
-                "install Claude Code, or add its directory to PATH."
-            )
+        if cli_path is not None and not Path(cli_path).is_file():
+            raise AgentError(f"agent {name!r}: no claude executable at {cli_path}.")
 
         self.name = name
         self.profile = profile
@@ -124,11 +150,11 @@ class Agent:
         self.timeout_s = timeout_s
         self.clean_context = clean_context
         self.log_dir = log_dir
+        self.cli_path = cli_path
 
-        self._exe = exe
-        # the CLI mints the id and reports it on the first reply. so None means this agent has
-        # never run, and an id can only have come from a call that completed — which is what
-        # lets a failed resume mean "expired" rather than "not created yet"
+        # The CLI mints the id and reports it on the first reply. So None means this agent
+        # has never run, and an id can only have come from a call that completed, which is
+        # what lets a failed resume mean "expired" rather than "not created yet".
         self.session_id = session_id
 
         self.results: list[dict] = []
@@ -141,17 +167,29 @@ class Agent:
         return self.results[-1] if self.results else None
 
     def run(self, prompt: str) -> dict:
-        """Runs a turn in this agent's own session, so it remembers its earlier turns."""
-        result = self._invoke(prompt, continuity=True)
+        """Runs a turn in this agent's own session, so it remembers its earlier turns.
+
+        Blocks until the turn ends. It cannot be called from inside a running event loop,
+        where arun() is the one to await instead.
+        """
+        return asyncio.run(self.arun(prompt))
+
+    def run_fresh(self, prompt: str) -> dict:
+        """Runs a throwaway turn with no memory, leaving this agent's session untouched."""
+        return asyncio.run(self.arun_fresh(prompt))
+
+    async def arun(self, prompt: str) -> dict:
+        """Runs a turn in this agent's own session, as run() does, for async callers."""
+        result = await self._invoke(prompt, continuity=True)
         self._record(result)
         # adopt whatever session the CLI used, so every later turn rejoins this conversation
         if result["ok"] and result["session_id"]:
             self.session_id = result["session_id"]
         return result
 
-    def run_fresh(self, prompt: str) -> dict:
-        """Runs a throwaway turn with no memory, leaving this agent's session untouched."""
-        result = self._invoke(prompt, continuity=False)
+    async def arun_fresh(self, prompt: str) -> dict:
+        """Runs a throwaway turn, as run_fresh() does, for async callers."""
+        result = await self._invoke(prompt, continuity=False)
         self._record(result)
         return result
 
@@ -165,61 +203,71 @@ class Agent:
         """Forgets the session so the next run starts a fresh conversation."""
         self.session_id = None
 
-    def _argv(self, *, continuity: bool) -> list[str]:
-        """Assembles the command line for one turn."""
-        argv = [
-            self._exe,
-            "--print",
-            "--output-format",
-            "json",
-            "--model",
-            str(self.model),
-            "--permission-mode",
-            str(self.permission_mode),
-            # nobody is watching, so anything that would prompt is denied rather than left hanging
-            "--permission-prompts",
-            "none",
-            "--append-system-prompt-file",
-            str(self.profile),
-        ]
+    def _options(self, *, continuity: bool, stderr: list[str] | None = None) -> ClaudeAgentOptions:
+        """Assembles the SDK options for one turn, collecting the CLI's stderr lines into
+        'stderr' when a list is given."""
+        builtin = _cli_names(self.allowed_tools)
+        available = list(builtin)
+        for rule in self.extra_allowed_tools:
+            base = _builtin_of(rule)
+            if base is not None and base not in available:
+                available.append(base)
 
+        extra_args: dict[str, str | None] = {
+            # nobody is watching, so anything that would prompt is denied rather than left hanging
+            "permission-prompts": "none",
+            # a file path rather than the text, so a long profile cannot hit the Windows argv limit
+            "append-system-prompt-file": str(self.profile.resolve()),
+        }
         # safe mode drops CLAUDE.md, hooks and skills, which keeps the reply clean and the prompt small
         if self.clean_context:
-            argv.append("--safe-mode")
+            extra_args["safe-mode"] = None
 
-        allowed = _cli_names(self.allowed_tools) + list(self.extra_allowed_tools)
-        denied = _cli_names(self.denied_tools)
-        if allowed:
-            argv += ["--allowed-tools", *allowed]
-        else:
-            # an empty allowlist must mean no tools; omitting the flag would instead mean all of them
-            denied = sorted(set(denied) | set(_CLI_NAMES.values()))
-        if denied:
-            argv += ["--disallowed-tools", *denied]
+        return ClaudeAgentOptions(
+            model=str(self.model),
+            permission_mode=str(self.permission_mode),
+            # Left as None, the SDK would pass an empty system prompt and erase Claude Code's
+            # own. The preset without "append" keeps it, and the profile is appended above.
+            system_prompt={"type": "preset", "preset": "claude_code"},
+            # tools sets what exists at all, so an empty list really does mean no tools
+            tools=available,
+            allowed_tools=builtin + list(self.extra_allowed_tools),
+            disallowed_tools=_cli_names(self.denied_tools),
+            output_format=(
+                {"type": "json_schema", "schema": self.schema} if self.schema is not None else None
+            ),
+            max_budget_usd=self.max_work_usd,
+            # one rule, no state: rejoin a session we have, and let the CLI mint one when we do not
+            resume=self.session_id if continuity and self.session_id else None,
+            cwd=self.cwd,
+            cli_path=self.cli_path,
+            extra_args=extra_args,
+            stderr=stderr.append if stderr is not None else None,
+        )
 
-        if self.schema is not None:
-            argv += ["--json-schema", json.dumps(self.schema)]
-        if self.max_work_usd is not None:
-            argv += ["--max-budget-usd", str(self.max_work_usd)]
+    def _session_exists(self) -> bool:
+        """Answers whether the CLI still holds this agent's session on disk."""
+        return get_session_info(self.session_id, directory=str(self.cwd)) is not None
 
-        # one rule, no state: rejoin a session we have, and let the CLI mint one when we do not
-        if continuity and self.session_id:
-            argv += ["--resume", self.session_id]
-
-        return argv
-
-    def _write_log(self, argv: list[str], stdout: str, stderr: str) -> Path | None:
-        """Saves the raw exchange so a failed call can be diagnosed afterwards."""
+    def _write_log(
+        self, options: ClaudeAgentOptions, messages: list[Any], stderr: list[str]
+    ) -> Path | None:
+        """Saves the options, every SDK message and the CLI's stderr, so a failed call can be
+        diagnosed afterwards."""
         if self.log_dir is None:
             return None
         self.log_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
         path = self.log_dir / f"{stamp}-{self.name}.log"
-        # the command line goes first, because a malformed flag is the most common cause of a bad call
-        path.write_text(
-            f"$ {' '.join(argv)}\n\n--- stdout ---\n{stdout}\n\n--- stderr ---\n{stderr}\n",
-            encoding="utf-8",
-        )
+        settings = {
+            key: value
+            for key, value in vars(options).items()
+            if value not in (None, [], {}, False) and not callable(value)
+        }
+        lines = ["--- options ---", json.dumps(settings, indent=2, default=str), "", "--- messages ---"]
+        lines += [json.dumps(_as_loggable(m), default=str) for m in messages]
+        lines += ["", "--- stderr ---", *stderr]
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return path
 
     def _failed(self, reason: str, log_path: Path | None = None, **extra) -> dict:
@@ -245,62 +293,59 @@ class Agent:
         result.update(extra)
         return result
 
-    def _invoke(self, prompt: str, *, continuity: bool) -> dict:
-        """Runs the CLI once and turns whatever came back into a result."""
-        argv = self._argv(continuity=continuity)
+    def _expired(self, log_path: Path | None = None) -> dict:
+        """Builds the result for a turn whose session has expired or been deleted.
+
+        The turn is never retried on a fresh session. A prompt written for an agent that
+        remembers is meaningless to one that does not, and it would answer anyway.
+        """
+        return self._failed(
+            f"the session {self.session_id} has expired or was deleted",
+            log_path,
+            session_expired=True,
+        )
+
+    async def _invoke(self, prompt: str, *, continuity: bool) -> dict:
+        """Runs the CLI once through the SDK and turns whatever came back into a result."""
+        # a session that is gone costs nothing to discover, so check before spawning anything
+        if continuity and self.session_id and not self._session_exists():
+            return self._expired()
+
+        stderr: list[str] = []
+        messages: list[Any] = []
+        options = self._options(continuity=continuity, stderr=stderr)
+        error: str | None = None
 
         try:
-            proc = subprocess.run(
-                argv,
-                # the prompt travels on stdin, so a long feature file cannot hit the Windows argv limit
-                input=prompt,
-                capture_output=True,
-                text=True,
-                # Windows would otherwise decode as cp1252 and mangle every dash and quote
-                encoding="utf-8",
-                errors="replace",
-                cwd=str(self.cwd),
-                shell=False,
-                timeout=self.timeout_s,
-            )
-        except subprocess.TimeoutExpired:
-            return self._failed(f"timed out after {self.timeout_s}s")
+            async with asyncio.timeout(self.timeout_s):
+                # aclosing shuts the CLI down even when the timeout abandons the stream
+                async with aclosing(query(prompt=prompt, options=options)) as stream:
+                    async for message in stream:
+                        messages.append(message)
+        except TimeoutError:
+            error = f"timed out after {self.timeout_s}s"
+        except CLINotFoundError as exc:
+            raise AgentError(f"agent {self.name!r}: {exc}") from exc
+        except ClaudeSDKError as exc:
+            # A failed turn yields its ResultMessage before the SDK raises ResultError, so
+            # the cost and usage survive in `messages` and are read below.
+            detail = str(exc).strip().splitlines()
+            error = detail[0][:300] if detail else type(exc).__name__
 
-        stdout = proc.stdout or ""
-        stderr = proc.stderr or ""
-        log_path = self._write_log(argv, stdout, stderr)
+        log_path = self._write_log(options, messages, stderr)
 
-        if proc.returncode != 0:
-            # the session we asked to rejoin is gone, which costs nothing to discover. it is
-            # never retried on a fresh session: a prompt written for an agent that remembers
-            # is meaningless to one that does not, and it would answer anyway
-            if "No conversation found with session ID" in (stderr + stdout):
-                return self._failed(
-                    f"the session {self.session_id} has expired or was deleted",
-                    log_path,
-                    session_expired=True,
-                )
-            # otherwise the CLI itself failed: a bad flag, an auth problem, or a crash
-            detail = (stderr.strip() or stdout.strip()).splitlines()
-            first = detail[0][:300] if detail else "no output"
-            return self._failed(f"exit {proc.returncode}: {first}", log_path)
+        final = next((m for m in reversed(messages) if isinstance(m, ResultMessage)), None)
+        if final is not None:
+            return self._parse(final, log_path)
+        # backstop for a session that vanished between the check above and the spawn
+        if continuity and any("No conversation found with session ID" in line for line in stderr):
+            return self._expired(log_path)
+        return self._failed(error or "the CLI produced no result", log_path)
 
-        if not stdout.strip():
-            return self._failed("the CLI produced no output", log_path)
-
-        try:
-            envelope = json.loads(stdout)
-        except json.JSONDecodeError:
-            # an error message printed as plain text lands here, so surface its first line
-            first = stdout.strip().splitlines()[0][:300]
-            return self._failed(f"output was not the JSON envelope: {first}", log_path)
-
-        return self._parse(envelope, log_path)
-
-    def _parse(self, envelope: dict, log_path: Path | None) -> dict:
-        """Turns the CLI's JSON envelope into this library's result."""
-        usage = envelope.get("usage") or {}
-        text = envelope.get("result") or ""
+    def _parse(self, message: ResultMessage, log_path: Path | None) -> dict:
+        """Turns the SDK's final ResultMessage into this library's result."""
+        usage = message.usage or {}
+        text = message.result or ""
 
         read = int(usage.get("input_tokens") or 0)
         written = int(usage.get("output_tokens") or 0)
@@ -311,8 +356,8 @@ class Agent:
             "ok": True,
             "text": text,
             "data": None,
-            "session_id": envelope.get("session_id"),
-            "cost_usd": float(envelope.get("total_cost_usd") or 0.0),
+            "session_id": message.session_id or None,
+            "cost_usd": float(message.total_cost_usd or 0.0),
             "input_tokens": read,
             "output_tokens": written,
             "cache_read_tokens": cached_read,
@@ -320,26 +365,29 @@ class Agent:
             # all four kinds, because a resumed turn's context arrives as cache reads and
             # counting only input plus output understates what the call really consumed
             "total_tokens": read + written + cached_read + cached_written,
-            "num_turns": int(envelope.get("num_turns") or 0),
-            "stop_reason": envelope.get("stop_reason"),
-            "denials": envelope.get("permission_denials") or [],
+            "num_turns": message.num_turns,
+            "stop_reason": message.stop_reason,
+            "denials": list(message.permission_denials or []),
             "failure": None,
             "session_expired": False,
             "log_path": log_path,
         }
 
-        # the CLI ran cleanly but the turn did not finish, which is a separate signal from the exit code
-        if envelope.get("is_error", True):
-            reason = envelope.get("subtype") or envelope.get("stop_reason") or "unknown"
+        # the result itself reports a turn that did not finish, such as one over its budget
+        if message.is_error:
+            reason = message.subtype or message.stop_reason or "unknown"
             result["ok"] = False
             result["failure"] = f"the turn did not complete: {reason}"
             return result
 
         if self.schema is not None:
-            try:
-                result["data"] = json.loads(text)
-            except json.JSONDecodeError:
-                result["ok"] = False
-                result["failure"] = "a schema was set but the reply did not parse as JSON"
+            if message.structured_output is not None:
+                result["data"] = message.structured_output
+            else:
+                try:
+                    result["data"] = json.loads(text)
+                except json.JSONDecodeError:
+                    result["ok"] = False
+                    result["failure"] = "a schema was set but the reply did not parse as JSON"
 
         return result
