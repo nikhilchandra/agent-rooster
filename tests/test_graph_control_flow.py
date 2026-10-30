@@ -32,6 +32,11 @@ class FakeAgent:
 @pytest.fixture
 def graph(tmp_path: Path) -> AgentGraph:
     """Builds a two-step graph with a gate between the steps."""
+    return build_graph(tmp_path)
+
+
+def build_graph(tmp_path: Path) -> AgentGraph:
+    """Returns a two-step graph with a gate between the steps, and fresh agents."""
     agents = {"writer": FakeAgent("writer", tmp_path), "tester": FakeAgent("tester", tmp_path)}
     g = AgentGraph("bdd", agents, start="write", state_dir=tmp_path / ".rooster")
 
@@ -146,6 +151,44 @@ def test_usage_is_totalled_across_agents(graph: AgentGraph) -> None:
 
     assert finished.tokens == 200
     assert finished.cost_usd == pytest.approx(0.02)
+
+
+def test_usage_accumulates_across_a_new_process(tmp_path: Path) -> None:
+    """Proves a resume in a new process adds to the saved totals instead of replacing them."""
+    started = build_graph(tmp_path).start("a feature")
+
+    # a new process builds new agents, whose totals start at zero
+    finished = build_graph(tmp_path).resume(started.slug)
+
+    assert finished.tokens == 200
+    assert finished.cost_usd == pytest.approx(0.02)
+
+
+def test_runs_sharing_agents_do_not_count_each_others_spend(graph: AgentGraph) -> None:
+    """Proves each run counts only what was spent on it, though the agents are shared."""
+    first = graph.start("a feature")
+    second = graph.start("another feature")
+
+    assert first.tokens == 100
+    assert second.tokens == 100
+
+
+def test_a_halted_step_still_counts_its_spend(tmp_path: Path) -> None:
+    """Proves a step that spends and then raises leaves its spend on the saved run."""
+    agents = {"writer": FakeAgent("writer", tmp_path)}
+    g = AgentGraph("x", agents, start="boom", state_dir=tmp_path / ".rooster")
+
+    @g.step("boom")
+    def boom(run: Run) -> None:
+        agents["writer"].run("anything")
+        raise ValueError("the agent wrote nonsense")
+
+    with pytest.raises(ValueError):
+        g.start("a feature")
+
+    saved = g.runs()[0]
+    assert saved.status == "halted"
+    assert saved.cost_usd == pytest.approx(0.01)
 
 
 def test_slugs_do_not_collide(graph: AgentGraph) -> None:

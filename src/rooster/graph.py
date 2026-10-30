@@ -82,6 +82,9 @@ class AgentGraph:
 
         self._steps: dict[str, Step] = {}
         self._gates: set[str] = set()
+        # The agents' combined cost and tokens at the last count, so a run is charged only
+        # for what was spent while it was advancing.
+        self._counted = (0.0, 0)
 
     # ------------------------------------------------------------------ declaring
 
@@ -147,6 +150,7 @@ class AgentGraph:
 
     def _advance(self, run: Run) -> Run:
         """Calls steps in turn until the run finishes, halts, or parks at a gate."""
+        self._counted = self._usage()
         for _ in range(self.max_steps):
             if run.cursor is None:
                 return self._finish(run, "done")
@@ -201,8 +205,18 @@ class AgentGraph:
                     )
                 except (ValueError, FileNotFoundError):
                     pass
-        run.cost_usd = sum(a.total_cost_usd for a in self.agents.values())
-        run.tokens = sum(a.total_tokens for a in self.agents.values())
+        # add only the spend since the last count, since agents may be new or shared by runs
+        cost, tokens = self._usage()
+        run.cost_usd += cost - self._counted[0]
+        run.tokens += tokens - self._counted[1]
+        self._counted = (cost, tokens)
+
+    def _usage(self) -> tuple[float, int]:
+        """Returns the cost and tokens that the agents have spent so far, combined."""
+        return (
+            sum(a.total_cost_usd for a in self.agents.values()),
+            sum(a.total_tokens for a in self.agents.values()),
+        )
 
     def _restore_sessions(self, run: Run) -> None:
         """Puts saved session ids back on the agents so they rejoin their conversations."""
