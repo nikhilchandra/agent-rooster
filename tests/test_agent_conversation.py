@@ -139,3 +139,38 @@ def test_an_expired_session_is_reported_and_costs_nothing(workspace: Path, plain
     assert result["cost_usd"] == 0.0
     # the agent must not quietly start over, since the caller's prompt assumed a memory
     assert agent.session_id == gone
+
+
+def test_non_ascii_text_survives_the_round_trip(workspace: Path, plain_profile: Path) -> None:
+    """Proves accented letters and dashes arrive intact rather than mangled by a Windows
+    codepage."""
+    agent = Agent("unicode", plain_profile, cwd=workspace, allowed_tools=Tool.NONE)
+
+    result = agent.run("Reply with exactly this word and nothing else: naïve—café")
+
+    assert result["ok"], result["failure"]
+    assert "naïve—café" in result["text"]
+
+
+def test_a_prompt_longer_than_the_windows_command_line_works(
+    workspace: Path, plain_profile: Path
+) -> None:
+    """Proves a prompt past the 32,767-character Windows command-line limit still arrives."""
+    agent = Agent("long", plain_profile, cwd=workspace, allowed_tools=Tool.NONE)
+    filler = "filler " * 6000
+    assert len(filler) > 40_000
+
+    result = agent.run(f"Ignore the filler text below. Reply with exactly: ok\n\n{filler}")
+
+    assert result["ok"], result["failure"]
+    assert result["text"].strip() == "ok"
+
+
+def test_a_timeout_is_reported_as_a_failure(workspace: Path, plain_profile: Path) -> None:
+    """Proves a turn that overruns timeout_s comes back as a failed result, not an exception."""
+    agent = Agent("slow", plain_profile, cwd=workspace, allowed_tools=Tool.NONE, timeout_s=2)
+
+    result = agent.run("Write the numbers from 1 to 2000, one per line.")
+
+    assert result["ok"] is False
+    assert "timed out" in result["failure"]
