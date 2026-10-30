@@ -184,6 +184,15 @@ def test_reset_forgets_the_session(tmp_path: Path) -> None:
     assert _options_for(agent).resume is None
 
 
+def test_a_new_agent_has_an_empty_transcript(tmp_path: Path) -> None:
+    """Proves an agent that has never run returns an empty transcript."""
+    profile = tmp_path / "p.md"
+    profile.write_text("x", encoding="utf-8")
+    agent = Agent("a", profile, cwd=tmp_path)
+
+    assert agent.transcript() == []
+
+
 def test_run_fresh_never_touches_the_session(tmp_path: Path) -> None:
     """Proves a throwaway turn leaves the agent's own conversation alone."""
     profile = tmp_path / "p.md"

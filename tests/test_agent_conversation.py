@@ -211,3 +211,32 @@ def test_a_timeout_is_reported_as_a_failure(workspace: Path, plain_profile: Path
 
     assert result["ok"] is False
     assert "timed out" in result["failure"]
+
+
+def test_transcript_holds_a_tool_call_and_its_result(workspace: Path, plain_profile: Path) -> None:
+    """Proves the transcript records a tool call and the result that answered it."""
+    agent = Agent("shell", plain_profile, cwd=workspace, allowed_tools=Tool.BASH)
+
+    result = agent.run("Run `echo hi` with the Bash tool and report its output.")
+    assert result["ok"], result["failure"]
+
+    transcript = agent.transcript()
+    assert transcript
+
+    # collect the ids of every tool call, then of every result sent back for one
+    calls = {
+        block["id"]
+        for m in transcript
+        if m.type == "assistant" and isinstance(m.message["content"], list)
+        for block in m.message["content"]
+        if block.get("type") == "tool_use"
+    }
+    answered = {
+        block["tool_use_id"]
+        for m in transcript
+        if m.type == "user" and isinstance(m.message["content"], list)
+        for block in m.message["content"]
+        if block.get("type") == "tool_result"
+    }
+    assert calls, "no assistant message made a tool call"
+    assert calls & answered, "no tool call has a matching tool_result"

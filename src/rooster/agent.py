@@ -16,7 +16,9 @@ from claude_agent_sdk import (
     ClaudeSDKError,
     CLINotFoundError,
     ResultMessage,
+    SessionMessage,
     get_session_info,
+    get_session_messages,
     query,
 )
 
@@ -280,6 +282,16 @@ class Agent:
     def _session_exists(self) -> bool:
         """Answers whether the CLI still holds this agent's session on disk."""
         return get_session_info(self.session_id, directory=str(self.cwd)) is not None
+
+    def transcript(self) -> list[SessionMessage]:
+        """Returns this agent's turn-by-turn transcript: every user/assistant message,
+        including tool calls and their results, in chronological order.
+
+        Returns an empty list if this agent has never run.
+        """
+        if self.session_id is None:
+            return []
+        return get_session_messages(self.session_id, directory=str(self.cwd))
 
     def _write_log(
         self, options: ClaudeAgentOptions, messages: list[Any], stderr: list[str]
