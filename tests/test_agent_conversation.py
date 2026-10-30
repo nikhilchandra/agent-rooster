@@ -6,11 +6,12 @@ import json
 from functools import reduce
 from operator import or_
 from pathlib import Path
+from typing import Literal
 
 import pytest
-from claude_agent_sdk import ResultMessage
+from pydantic import BaseModel
 
-from rooster import Agent, Model, Tool
+from rooster import Agent, Command, Model, Tool
 from rooster.agent import _ALIASES, _CLI_NAMES
 
 pytestmark = pytest.mark.live
@@ -19,10 +20,23 @@ pytestmark = pytest.mark.live
 NEEDS_SETUP = {"LSP", "ListMcpResourcesTool", "ReadMcpResourceTool"}
 
 
+class Verdict(BaseModel):
+    """Holds a reviewer's verdict on a patch."""
+
+    verdict: Literal["approved", "changes_requested"]
+    reason: str
+
+
 @pytest.fixture
 def workspace(tmp_path: Path) -> Path:
     """Gives each test its own directory for the agent to run in."""
     return tmp_path
+
+
+@pytest.fixture
+def logs(workspace: Path) -> Path:
+    """Gives each test's agents a log folder inside its workspace."""
+    return workspace / "logs"
 
 
 @pytest.fixture
@@ -33,15 +47,11 @@ def plain_profile(workspace: Path) -> Path:
     return path
 
 
-def test_envelope_parses_and_context_is_clean(workspace: Path, plain_profile: Path) -> None:
-    """Proves the JSON envelope parses and that clean_context keeps the reply bare."""
-    agent = Agent(
-        "plain",
-        plain_profile,
-        cwd=workspace,
-        allowed_tools=Tool.NONE,
-        log_dir=workspace / "logs",
-    )
+def test_envelope_parses_and_context_is_clean(
+    workspace: Path, logs: Path, plain_profile: Path
+) -> None:
+    """Proves the JSON envelope parses and that safe mode keeps the reply bare."""
+    agent = Agent("plain", plain_profile, cwd=workspace, log_dir=logs, tools=Tool.NONE)
 
     result = agent.run("Reply with exactly: ok")
 
@@ -53,14 +63,14 @@ def test_envelope_parses_and_context_is_clean(workspace: Path, plain_profile: Pa
     assert agent.total_tokens > 0
 
 
-def test_profile_reaches_the_model(workspace: Path) -> None:
+def test_profile_reaches_the_model(workspace: Path, logs: Path) -> None:
     """Proves an appended profile survives safe mode and shapes the reply."""
     profile = workspace / "reviewer.md"
     profile.write_text(
         "You are REVIEWER-7. Begin every reply with the literal token [REVIEWER-7].",
         encoding="utf-8",
     )
-    agent = Agent("reviewer", profile, cwd=workspace, allowed_tools=Tool.NONE)
+    agent = Agent("reviewer", profile, cwd=workspace, log_dir=logs, tools=Tool.NONE)
 
     result = agent.run("State your designation in one short line.")
 
@@ -68,35 +78,21 @@ def test_profile_reaches_the_model(workspace: Path) -> None:
     assert "[REVIEWER-7]" in result["text"]
 
 
-def test_schema_returns_parsed_data(workspace: Path, plain_profile: Path) -> None:
-    """Proves a schema-constrained reply arrives as a dict, needing no parser."""
-    verdict = {
-        "type": "object",
-        "properties": {
-            "verdict": {"type": "string", "enum": ["approved", "changes_requested"]},
-            "reason": {"type": "string"},
-        },
-        "required": ["verdict", "reason"],
-        "additionalProperties": False,
-    }
-    agent = Agent(
-        "gate",
-        plain_profile,
-        cwd=workspace,
-        allowed_tools=Tool.NONE,
-        schema=verdict,
-    )
+def test_schema_returns_an_instance(workspace: Path, logs: Path, plain_profile: Path) -> None:
+    """Proves a schema-constrained reply arrives as an instance of the schema class."""
+    agent = Agent("gate", plain_profile, cwd=workspace, log_dir=logs, tools=Tool.NONE,
+                  schema=Verdict)
 
     result = agent.run("A patch deletes a test so the suite passes. Give your verdict.")
 
     assert result["ok"], result["failure"]
-    assert isinstance(result["data"], dict)
-    assert result["data"]["verdict"] in {"approved", "changes_requested"}
+    assert isinstance(result["data"], Verdict)
+    assert result["data"].verdict in {"approved", "changes_requested"}
 
 
-def test_session_continues_across_calls(workspace: Path, plain_profile: Path) -> None:
+def test_session_continues_across_calls(workspace: Path, logs: Path, plain_profile: Path) -> None:
     """Proves a second run rejoins the first, so the agent remembers its own turns."""
-    agent = Agent("memory", plain_profile, cwd=workspace, allowed_tools=Tool.NONE)
+    agent = Agent("memory", plain_profile, cwd=workspace, log_dir=logs, tools=Tool.NONE)
 
     first = agent.run("Remember the number 41. Reply with exactly: stored")
     assert first["ok"], first["failure"]
@@ -115,10 +111,10 @@ def test_session_continues_across_calls(workspace: Path, plain_profile: Path) ->
 
 
 def test_a_forked_question_remembers_without_moving_the_session(
-    workspace: Path, plain_profile: Path
+    workspace: Path, logs: Path, plain_profile: Path
 ) -> None:
     """Proves a forked turn sees the agent's memory and leaves its own session where it was."""
-    agent = Agent("memory", plain_profile, cwd=workspace, allowed_tools=Tool.NONE)
+    agent = Agent("memory", plain_profile, cwd=workspace, log_dir=logs, tools=Tool.NONE)
     opening = agent.run("Remember the number 77. Reply with exactly: stored")
     assert opening["ok"], opening["failure"]
     before = agent.session_id
@@ -131,9 +127,11 @@ def test_a_forked_question_remembers_without_moving_the_session(
     assert agent.session_id == before
 
 
-def test_a_fork_with_nothing_to_fork_from_fails(workspace: Path, plain_profile: Path) -> None:
+def test_a_fork_with_nothing_to_fork_from_fails(
+    workspace: Path, logs: Path, plain_profile: Path
+) -> None:
     """Proves forking an agent that has never run fails before any CLI call."""
-    agent = Agent("new", plain_profile, cwd=workspace, allowed_tools=Tool.NONE)
+    agent = Agent("new", plain_profile, cwd=workspace, log_dir=logs, tools=Tool.NONE)
 
     result = agent.run_forked("Anything.")
 
@@ -141,17 +139,18 @@ def test_a_fork_with_nothing_to_fork_from_fails(workspace: Path, plain_profile: 
     assert agent.session_id is None
 
 
-
-def test_a_second_agent_object_resumes_the_first(workspace: Path, plain_profile: Path) -> None:
+def test_a_second_agent_object_resumes_the_first(
+    workspace: Path, logs: Path, plain_profile: Path
+) -> None:
     """Proves a rebuilt agent rejoins the conversation, which is what surviving a gate needs."""
-    first = Agent("memory", plain_profile, cwd=workspace, allowed_tools=Tool.NONE)
+    first = Agent("memory", plain_profile, cwd=workspace, log_dir=logs, tools=Tool.NONE)
     opening = first.run("Remember the number 63. Reply with exactly: stored")
     assert opening["ok"], opening["failure"]
     saved_id = first.session_id
     assert saved_id
 
-    # a separate object, exactly as a later `bdd continue` process would build it
-    second = Agent("memory", plain_profile, cwd=workspace, allowed_tools=Tool.NONE,
+    # a separate object, exactly as a later process would build it after a gate
+    second = Agent("memory", plain_profile, cwd=workspace, log_dir=logs, tools=Tool.NONE,
                    session_id=saved_id)
     result = second.run("What number did I ask you to remember? Reply with just the number.")
 
@@ -160,10 +159,12 @@ def test_a_second_agent_object_resumes_the_first(workspace: Path, plain_profile:
     assert second.session_id == saved_id
 
 
-def test_an_expired_session_is_reported_and_costs_nothing(workspace: Path, plain_profile: Path) -> None:
+def test_an_expired_session_is_reported_and_costs_nothing(
+    workspace: Path, logs: Path, plain_profile: Path
+) -> None:
     """Proves a vanished session is named as such rather than silently replaced."""
     gone = "00000000-0000-4000-8000-000000000000"
-    agent = Agent("ghost", plain_profile, cwd=workspace, allowed_tools=Tool.NONE,
+    agent = Agent("ghost", plain_profile, cwd=workspace, log_dir=logs, tools=Tool.NONE,
                   session_id=gone)
 
     result = agent.run("Anything.")
@@ -175,10 +176,12 @@ def test_an_expired_session_is_reported_and_costs_nothing(workspace: Path, plain
     assert agent.session_id == gone
 
 
-def test_non_ascii_text_survives_the_round_trip(workspace: Path, plain_profile: Path) -> None:
+def test_non_ascii_text_survives_the_round_trip(
+    workspace: Path, logs: Path, plain_profile: Path
+) -> None:
     """Proves accented letters and dashes arrive intact rather than mangled by a Windows
     codepage."""
-    agent = Agent("unicode", plain_profile, cwd=workspace, allowed_tools=Tool.NONE)
+    agent = Agent("unicode", plain_profile, cwd=workspace, log_dir=logs, tools=Tool.NONE)
 
     result = agent.run("Reply with exactly this word and nothing else: naïve—café")
 
@@ -187,10 +190,10 @@ def test_non_ascii_text_survives_the_round_trip(workspace: Path, plain_profile: 
 
 
 def test_a_prompt_longer_than_the_windows_command_line_works(
-    workspace: Path, plain_profile: Path
+    workspace: Path, logs: Path, plain_profile: Path
 ) -> None:
     """Proves a prompt past the 32,767-character Windows command-line limit still arrives."""
-    agent = Agent("long", plain_profile, cwd=workspace, allowed_tools=Tool.NONE)
+    agent = Agent("long", plain_profile, cwd=workspace, log_dir=logs, tools=Tool.NONE)
     filler = "filler " * 6000
     assert len(filler) > 40_000
 
@@ -200,18 +203,14 @@ def test_a_prompt_longer_than_the_windows_command_line_works(
     assert result["text"].strip() == "ok"
 
 
-def test_the_cli_provides_every_named_tool(workspace: Path, plain_profile: Path) -> None:
+def test_the_cli_provides_every_named_tool(
+    workspace: Path, logs: Path, plain_profile: Path
+) -> None:
     """Proves the CLI starts with every tool that _CLI_NAMES names, apart from the ones that
     need a plugin or an MCP server, so none is silently dropped as a name the CLI no longer
     knows."""
-    agent = Agent(
-        "every",
-        plain_profile,
-        cwd=workspace,
-        model=Model.HAIKU,
-        allowed_tools=reduce(or_, _CLI_NAMES),
-        log_dir=workspace / "logs",
-    )
+    agent = Agent("every", plain_profile, cwd=workspace, log_dir=logs, model=Model.HAIKU,
+                  tools=reduce(or_, _CLI_NAMES))
 
     result = agent.run("Reply with exactly: ok")
 
@@ -230,9 +229,12 @@ def test_the_cli_provides_every_named_tool(workspace: Path, plain_profile: Path)
     assert not missing, f"the CLI did not start with {sorted(missing)}"
 
 
-def test_a_timeout_is_reported_as_a_failure(workspace: Path, plain_profile: Path) -> None:
+def test_a_timeout_is_reported_as_a_failure(
+    workspace: Path, logs: Path, plain_profile: Path
+) -> None:
     """Proves a turn that overruns timeout_s comes back as a failed result, not an exception."""
-    agent = Agent("slow", plain_profile, cwd=workspace, allowed_tools=Tool.NONE, timeout_s=2)
+    agent = Agent("slow", plain_profile, cwd=workspace, log_dir=logs, tools=Tool.NONE,
+                  timeout_s=2)
 
     result = agent.run("Write the numbers from 1 to 2000, one per line.")
 
@@ -240,60 +242,55 @@ def test_a_timeout_is_reported_as_a_failure(workspace: Path, plain_profile: Path
     assert "timed out" in result["failure"]
 
 
-def test_on_message_sees_each_message(workspace: Path, plain_profile: Path) -> None:
-    """Proves the observer receives the turn's raw SDK messages, including its ResultMessage."""
-    seen: list = []
-    agent = Agent("watched", plain_profile, cwd=workspace, allowed_tools=Tool.NONE,
-                  on_message=seen.append)
+def test_editable_and_frozen_limit_where_the_agent_writes(
+    workspace: Path, logs: Path, plain_profile: Path
+) -> None:
+    """Proves an agent can write inside 'editable', and is refused outside it and on a
+    'frozen' path inside it."""
+    (workspace / "src").mkdir()
+    (workspace / "other").mkdir()
+    agent = Agent("guarded", plain_profile, cwd=workspace, log_dir=logs, tools=Tool.AUTHOR,
+                  editable=("src/**",), frozen=("**/*.feature",))
 
-    result = agent.run("Reply with exactly: ok")
-
-    assert result["ok"], result["failure"]
-    assert seen
-    assert any(isinstance(m, ResultMessage) for m in seen)
-
-
-def test_a_raising_observer_leaves_the_result_intact(workspace: Path, plain_profile: Path) -> None:
-    """Proves an observer that raises on every message cannot fail the turn."""
-    agent = Agent("watched", plain_profile, cwd=workspace, allowed_tools=Tool.NONE,
-                  on_message=lambda m: (_ for _ in ()).throw(RuntimeError("boom")))
-
-    result = agent.run("Reply with exactly: ok")
-
-    assert result["ok"] is True, result["failure"]
-
-
-def test_a_permission_policy_refuses_a_tool(workspace: Path, plain_profile: Path) -> None:
-    """Proves a permission_policy that refuses Bash stops a Bash call, even though
-    allowed_tools names Bash, and that the refusal is reported in the result."""
-    asked: list[str] = []
-
-    def no_bash(tool_name: str, tool_input: dict) -> bool | tuple[bool, str]:
-        asked.append(tool_name)
-        if tool_name == "Bash":
-            return False, "Bash is not permitted for this agent"
-        return True
-
-    agent = Agent("guarded", plain_profile, cwd=workspace,
-                  allowed_tools=Tool.BASH | Tool.READ, permission_policy=no_bash)
-
-    # not `echo`, which the CLI treats as read-only and approves before any policy is asked
     result = agent.run(
-        'Use the Bash tool to run exactly: python -c "print(6*7)"  then tell me what it '
-        "printed. If the tool call is refused, say so plainly and do not guess the output."
+        "Use the Write tool three times, once for each of these files, each containing the "
+        "word hi: src/ok.txt, other/no.txt, src/x.feature. Attempt all three even if one is "
+        "refused. Then list which ones were refused."
     )
 
     assert result["ok"], result["failure"]
-    assert "Bash" in asked
-    assert result["denials"], "the policy refused Bash but no denial was reported"
+    assert (workspace / "src" / "ok.txt").is_file()
+    assert not (workspace / "other" / "no.txt").exists()
+    assert not (workspace / "src" / "x.feature").exists()
+    assert len(result["denials"]) >= 2
+
+
+def test_a_command_runs_and_any_other_is_refused(
+    workspace: Path, logs: Path, plain_profile: Path
+) -> None:
+    """Proves Command.PYTEST lets the agent run pytest and refuses a command it does not name."""
+    (workspace / "test_one.py").write_text("def test_one():\n    assert True\n", encoding="utf-8")
+    agent = Agent("tester", plain_profile, cwd=workspace, log_dir=logs, tools=Tool.INSPECT,
+                  commands=Command.PYTEST)
+
+    # not `echo`, which the CLI treats as read-only and approves without any rule
+    result = agent.run(
+        'Use the Bash tool to run exactly: python -m pytest -q test_one.py  then run exactly: '
+        'python -c "print(6*7)"  Report each output. If a call is refused, say so plainly and '
+        "do not guess its output."
+    )
+
+    assert result["ok"], result["failure"]
+    assert "1 passed" in result["text"]
     assert any(d["tool_name"] == "Bash" for d in result["denials"])
-    # the command never ran, so its output cannot be in the reply
     assert "42" not in result["text"]
 
 
-def test_transcript_holds_a_tool_call_and_its_result(workspace: Path, plain_profile: Path) -> None:
+def test_transcript_holds_a_tool_call_and_its_result(
+    workspace: Path, logs: Path, plain_profile: Path
+) -> None:
     """Proves the transcript records a tool call and the result that answered it."""
-    agent = Agent("shell", plain_profile, cwd=workspace, allowed_tools=Tool.BASH)
+    agent = Agent("shell", plain_profile, cwd=workspace, log_dir=logs, tools=Tool.BASH)
 
     result = agent.run("Run `echo hi` with the Bash tool and report its output.")
     assert result["ok"], result["failure"]

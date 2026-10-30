@@ -2,28 +2,61 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 from pathlib import Path
 
 import pytest
-from claude_agent_sdk import ClaudeAgentOptions
+from claude_agent_sdk import ClaudeAgentOptions, ResultMessage
+from pydantic import BaseModel
 
-from rooster import Agent, AgentError, Effort, Model, PermissionMode, Tool
-from rooster.agent import _CLI_NAMES, _cli_names
+from rooster import Agent, AgentError, Command, Effort, Model, PermissionMode, Tool
+from rooster.agent import _CLI_NAMES, _COMMAND_PATTERNS, _bash_rules, _cli_names
+
+
+class Verdict(BaseModel):
+    """Holds a reviewer's verdict, as a schema for the tests below."""
+
+    verdict: str
+    reason: str
+
+
+@pytest.fixture
+def make(tmp_path: Path):
+    """Returns a function that builds an agent with a real profile and a log folder."""
+    profile = tmp_path / "p.md"
+    profile.write_text("x", encoding="utf-8")
+
+    def build(**settings) -> Agent:
+        settings.setdefault("cwd", tmp_path)
+        settings.setdefault("log_dir", tmp_path / "logs")
+        return Agent("a", profile, **settings)
+
+    return build
+
+
+def _options_for(agent: Agent) -> ClaudeAgentOptions:
+    """Builds a first-turn set of options for inspection."""
+    return agent._options(continuity=True)
+
+
+def _result(**fields) -> ResultMessage:
+    """Builds a finished turn's ResultMessage, with 'fields' replacing the defaults."""
+    defaults = dict(subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+                    num_turns=1, session_id="s", total_cost_usd=0.01, result="")
+    return ResultMessage(**{**defaults, **fields})
 
 
 def test_missing_profile_raises(tmp_path: Path) -> None:
     """Proves a misconfigured agent fails at construction, before any subprocess runs."""
     with pytest.raises(AgentError, match="no profile at"):
-        Agent("broken", tmp_path / "absent.md", cwd=tmp_path)
+        Agent("broken", tmp_path / "absent.md", cwd=tmp_path, log_dir=tmp_path)
 
 
-def test_missing_cli_path_raises(tmp_path: Path) -> None:
+def test_missing_cli_path_raises(make, tmp_path: Path) -> None:
     """Proves a cli_path that names nothing fails at construction."""
-    profile = tmp_path / "p.md"
-    profile.write_text("x", encoding="utf-8")
     with pytest.raises(AgentError, match="no claude executable"):
-        Agent("broken", profile, cwd=tmp_path, cli_path=tmp_path / "claude.exe")
+        make(cli_path=tmp_path / "claude.exe")
 
 
 def test_tool_flags_compose() -> None:
@@ -58,12 +91,9 @@ def test_tasks_expands_to_the_four_task_tools() -> None:
     assert set(_cli_names(Tool.TASKS)) == {"TaskCreate", "TaskGet", "TaskList", "TaskUpdate"}
 
 
-def test_full_asks_for_agent_and_no_retired_name(tmp_path: Path) -> None:
+def test_full_asks_for_agent_and_no_retired_name(make) -> None:
     """Proves Tool.FULL asks the CLI for Agent, and for neither Task nor TodoWrite."""
-    profile = tmp_path / "p.md"
-    profile.write_text("x", encoding="utf-8")
-
-    tools = Agent("a", profile, cwd=tmp_path, allowed_tools=Tool.FULL)._options(continuity=True).tools
+    tools = _options_for(make(tools=Tool.FULL)).tools
 
     assert "Agent" in tools
     assert "Task" not in tools
@@ -78,128 +108,141 @@ def test_enums_are_their_cli_strings() -> None:
     assert str(Effort.HIGH) == "high"
 
 
-def _options_for(agent: Agent) -> ClaudeAgentOptions:
-    """Builds a first-turn set of options for inspection."""
-    return agent._options(continuity=True)
-
-
-def test_allowlist_becomes_cli_tool_names(tmp_path: Path) -> None:
+def test_allowlist_becomes_cli_tool_names(make) -> None:
     """Proves a tool combination expands into the names the CLI expects."""
-    profile = tmp_path / "p.md"
-    profile.write_text("x", encoding="utf-8")
-    agent = Agent("a", profile, cwd=tmp_path, allowed_tools=Tool.INSPECT)
-
-    options = _options_for(agent)
+    options = _options_for(make(tools=Tool.INSPECT))
 
     assert set(options.tools) == {"Read", "Glob", "Grep"}
     assert set(options.allowed_tools) == {"Read", "Glob", "Grep"}
 
 
-def test_empty_allowlist_denies_every_tool(tmp_path: Path) -> None:
+def test_empty_allowlist_denies_every_tool(make) -> None:
     """Proves Tool.NONE means no tools, rather than silently meaning all of them."""
-    profile = tmp_path / "p.md"
-    profile.write_text("x", encoding="utf-8")
-    agent = Agent("a", profile, cwd=tmp_path, allowed_tools=Tool.NONE)
-
-    options = _options_for(agent)
+    options = _options_for(make(tools=Tool.NONE))
 
     # None would leave the CLI's default set available, where an empty list means none at all
     assert options.tools == []
     assert options.allowed_tools == []
 
 
-def test_an_mcp_rule_adds_no_builtin_tool(tmp_path: Path) -> None:
-    """Proves allowing an MCP tool leaves the built-in tools as the flags set them."""
-    profile = tmp_path / "p.md"
-    profile.write_text("x", encoding="utf-8")
-    agent = Agent("a", profile, cwd=tmp_path, allowed_tools=Tool.NONE,
-                  extra_allowed_tools=("mcp__x__y",))
+def test_bash_in_tools_allows_every_command(make) -> None:
+    """Proves Tool.BASH approves Bash itself, and that unapproved calls are still denied."""
+    options = _options_for(make(tools=Tool.BASH | Tool.READ))
 
-    options = _options_for(agent)
-
-    assert options.tools == []
-    assert options.allowed_tools == ["mcp__x__y"]
-
-
-def test_a_pattern_rule_makes_its_tool_available(tmp_path: Path) -> None:
-    """Proves a rule like "Bash(git *)" makes Bash exist, or the rule could never apply."""
-    profile = tmp_path / "p.md"
-    profile.write_text("x", encoding="utf-8")
-    agent = Agent("a", profile, cwd=tmp_path, allowed_tools=Tool.INSPECT,
-                  extra_allowed_tools=("Bash(git *)",))
-
-    options = _options_for(agent)
-
-    assert "Bash" in options.tools
-    assert "Bash(git *)" in options.allowed_tools
-    assert "Bash" not in options.allowed_tools
-
-
-def test_a_permission_policy_becomes_can_use_tool(tmp_path: Path) -> None:
-    """Proves a permission_policy is handed to the SDK as its can_use_tool callback."""
-    profile = tmp_path / "p.md"
-    profile.write_text("x", encoding="utf-8")
-    agent = Agent("a", profile, cwd=tmp_path, permission_policy=lambda name, args: True)
-
-    assert _options_for(agent).can_use_tool is not None
-
-
-def test_a_permission_policy_pre_approves_no_builtin_tool(tmp_path: Path) -> None:
-    """Proves a policy leaves the built-in tools available but unapproved, so the policy
-    decides every call to them."""
-    profile = tmp_path / "p.md"
-    profile.write_text("x", encoding="utf-8")
-    agent = Agent("a", profile, cwd=tmp_path, allowed_tools=Tool.BASH | Tool.READ,
-                  extra_allowed_tools=("Bash(git *)",),
-                  permission_policy=lambda name, args: True)
-
-    options = _options_for(agent)
-
-    assert set(options.tools) == {"Bash", "Read"}
-    assert options.allowed_tools == ["Bash(git *)"]
-    # --permission-prompts none would deny each call before the policy is asked
-    assert "permission-prompts" not in options.extra_args
-
-
-def test_no_permission_policy_leaves_the_allowlist_alone(tmp_path: Path) -> None:
-    """Proves an agent without a policy still pre-approves its built-in tools."""
-    profile = tmp_path / "p.md"
-    profile.write_text("x", encoding="utf-8")
-    agent = Agent("a", profile, cwd=tmp_path, allowed_tools=Tool.BASH | Tool.READ)
-
-    options = _options_for(agent)
-
-    assert options.can_use_tool is None
     assert set(options.tools) == {"Bash", "Read"}
     assert set(options.allowed_tools) == {"Bash", "Read"}
     assert options.extra_args["permission-prompts"] == "none"
 
 
-def test_a_permission_policy_with_bypass_mode_raises(tmp_path: Path) -> None:
-    """Proves a policy that bypass mode would never consult fails at construction."""
-    profile = tmp_path / "p.md"
-    profile.write_text("x", encoding="utf-8")
+def test_every_command_has_patterns() -> None:
+    """Proves each single Command flag maps to at least one command pattern."""
+    singles = {member for member in Command.__members__.values() if member.value}
+    assert singles == _COMMAND_PATTERNS.keys()
+    assert all(_COMMAND_PATTERNS[member] for member in singles)
+
+
+def test_a_command_makes_bash_available_for_it_alone(make) -> None:
+    """Proves a Command makes Bash exist and approves only its own commands."""
+    options = _options_for(make(tools=Tool.INSPECT, commands=Command.GIT_MV))
+
+    assert "Bash" in options.tools
+    assert "Bash(git mv *)" in options.allowed_tools
+    assert "Bash" not in options.allowed_tools
+
+
+def test_a_command_pattern_also_matches_its_bare_command() -> None:
+    """Proves "pytest *" brings "pytest" with it, so a run with no arguments is allowed."""
+    rules = _bash_rules(Command.PYTEST | Command.GIT_READ)
+
+    assert "Bash(pytest *)" in rules
+    assert "Bash(pytest)" in rules
+    assert "Bash(uv run pytest)" in rules
+    assert "Bash(git status)" in rules
+
+
+def test_no_paths_leaves_edits_to_the_permission_mode(make) -> None:
+    """Proves an agent without 'editable' approves edits anywhere, in accept-edits mode."""
+    options = _options_for(make(tools=Tool.AUTHOR))
+
+    assert {"Edit", "Write"} <= set(options.allowed_tools)
+    assert options.permission_mode == "acceptEdits"
+    assert options.disallowed_tools == []
+
+
+def test_editable_approves_edits_only_by_path(make) -> None:
+    """Proves 'editable' leaves the bare edit tools unapproved, adds a path rule for each
+    pattern, and switches out of accept-edits mode, which would approve every edit."""
+    options = _options_for(make(tools=Tool.AUTHOR, editable=("src/**", "tests/**")))
+
+    assert {"Edit", "Write"} <= set(options.tools)
+    assert "Edit" not in options.allowed_tools
+    assert "Write" not in options.allowed_tools
+    assert {"Edit(src/**)", "Edit(tests/**)", "Read"} <= set(options.allowed_tools)
+    assert options.permission_mode == "dontAsk"
+
+
+def test_frozen_becomes_a_deny_rule(make) -> None:
+    """Proves each frozen pattern becomes a deny rule, with or without 'editable'."""
+    options = _options_for(make(tools=Tool.AUTHOR, frozen=("**/*.feature",)))
+
+    assert options.disallowed_tools == ["Edit(**/*.feature)"]
+
+
+def test_editable_with_bypass_mode_raises(make) -> None:
+    """Proves 'editable' fails at construction when bypass mode would skip its rules."""
     with pytest.raises(AgentError, match="BYPASS"):
-        Agent("a", profile, cwd=tmp_path, permission_mode=PermissionMode.BYPASS,
-              permission_policy=lambda name, args: True)
+        make(editable=("src/**",), permission_mode=PermissionMode.BYPASS)
 
 
-def test_profile_is_appended_to_the_claude_code_prompt(tmp_path: Path) -> None:
+def test_profile_is_appended_to_the_claude_code_prompt(make, tmp_path: Path) -> None:
     """Proves the profile adds to Claude Code's system prompt rather than replacing it."""
-    profile = tmp_path / "p.md"
-    profile.write_text("x", encoding="utf-8")
-
-    options = _options_for(Agent("a", profile, cwd=tmp_path))
+    options = _options_for(make())
 
     assert options.system_prompt == {"type": "preset", "preset": "claude_code"}
-    assert options.extra_args["append-system-prompt-file"] == str(profile.resolve())
+    assert options.extra_args["append-system-prompt-file"] == str((tmp_path / "p.md").resolve())
 
 
-def test_a_new_agent_asks_for_no_particular_session(tmp_path: Path) -> None:
+def test_a_schema_class_becomes_its_json_schema(make) -> None:
+    """Proves a pydantic class reaches the SDK as the JSON schema it describes."""
+    options = _options_for(make(schema=Verdict))
+
+    assert options.output_format == {"type": "json_schema", "schema": Verdict.model_json_schema()}
+
+
+def test_a_reply_that_fits_the_schema_arrives_as_an_instance(make) -> None:
+    """Proves structured output is turned into an instance of the schema class."""
+    agent = make(schema=Verdict)
+
+    result = agent._parse(_result(structured_output={"verdict": "ok", "reason": "fine"}), None)
+
+    assert result["ok"]
+    assert result["data"] == Verdict(verdict="ok", reason="fine")
+
+
+def test_a_reply_in_plain_text_is_read_as_json(make) -> None:
+    """Proves a reply with no structured output is read from its text."""
+    agent = make(schema=Verdict)
+
+    result = agent._parse(_result(result=json.dumps({"verdict": "ok", "reason": "fine"})), None)
+
+    assert result["ok"]
+    assert result["data"].verdict == "ok"
+
+
+def test_a_reply_that_does_not_fit_the_schema_fails(make) -> None:
+    """Proves a reply missing a required field is a failed turn that names the class."""
+    agent = make(schema=Verdict)
+
+    result = agent._parse(_result(structured_output={"verdict": "ok"}), None)
+
+    assert result["ok"] is False
+    assert result["data"] is None
+    assert "Verdict" in result["failure"]
+
+
+def test_a_new_agent_asks_for_no_particular_session(make) -> None:
     """Proves a first call carries no session, leaving the CLI to mint the id."""
-    profile = tmp_path / "p.md"
-    profile.write_text("x", encoding="utf-8")
-    agent = Agent("a", profile, cwd=tmp_path)
+    agent = make()
 
     options = _options_for(agent)
 
@@ -208,25 +251,20 @@ def test_a_new_agent_asks_for_no_particular_session(tmp_path: Path) -> None:
     assert options.resume is None
 
 
-def test_an_agent_holding_an_id_always_resumes(tmp_path: Path) -> None:
+def test_an_agent_holding_an_id_always_resumes(make) -> None:
     """Proves a saved id means rejoin, which is what makes a run survive a human gate."""
-    profile = tmp_path / "p.md"
-    profile.write_text("x", encoding="utf-8")
     saved = "28aff200-76ed-4718-a98a-0d67857acbb5"
 
-    agent = Agent("a", profile, cwd=tmp_path, session_id=saved)
+    options = _options_for(make(session_id=saved))
 
-    options = _options_for(agent)
     # a session_id on an existing session is rejected as "already in use", so it must never be set
     assert options.resume == saved
     assert options.session_id is None
 
 
-def test_reset_forgets_the_session(tmp_path: Path) -> None:
+def test_reset_forgets_the_session(make) -> None:
     """Proves reset abandons the conversation without discarding the result history."""
-    profile = tmp_path / "p.md"
-    profile.write_text("x", encoding="utf-8")
-    agent = Agent("a", profile, cwd=tmp_path, session_id="something")
+    agent = make(session_id="something")
 
     agent.reset()
 
@@ -234,34 +272,15 @@ def test_reset_forgets_the_session(tmp_path: Path) -> None:
     assert _options_for(agent).resume is None
 
 
-def test_a_new_agent_has_an_empty_transcript(tmp_path: Path) -> None:
+def test_a_new_agent_has_an_empty_transcript(make) -> None:
     """Proves an agent that has never run returns an empty transcript."""
-    profile = tmp_path / "p.md"
-    profile.write_text("x", encoding="utf-8")
-    agent = Agent("a", profile, cwd=tmp_path)
-
-    assert agent.transcript() == []
+    assert make().transcript() == []
 
 
-def test_on_message_is_stored(tmp_path: Path) -> None:
-    """Proves the observer handed to the constructor is the one the agent keeps."""
-    profile = tmp_path / "p.md"
-    profile.write_text("x", encoding="utf-8")
-
-    def observe(message: object) -> None:
-        pass
-
-    agent = Agent("a", profile, cwd=tmp_path, on_message=observe)
-
-    assert agent.on_message is observe
-
-
-def test_run_fresh_never_touches_the_session(tmp_path: Path) -> None:
+def test_run_fresh_never_touches_the_session(make) -> None:
     """Proves a throwaway turn leaves the agent's own conversation alone."""
-    profile = tmp_path / "p.md"
-    profile.write_text("x", encoding="utf-8")
     saved = "28aff200-76ed-4718-a98a-0d67857acbb5"
-    agent = Agent("a", profile, cwd=tmp_path, session_id=saved)
+    agent = make(session_id=saved)
 
     options = agent._options(continuity=False)
 
@@ -269,69 +288,54 @@ def test_run_fresh_never_touches_the_session(tmp_path: Path) -> None:
     assert agent.session_id == saved
 
 
-def test_a_fork_resumes_a_copy_of_the_session(tmp_path: Path) -> None:
+def test_a_fork_resumes_a_copy_of_the_session(make) -> None:
     """Proves a forked turn resumes this agent's session and asks the CLI to copy it."""
-    profile = tmp_path / "p.md"
-    profile.write_text("x", encoding="utf-8")
     saved = "28aff200-76ed-4718-a98a-0d67857acbb5"
-    agent = Agent("a", profile, cwd=tmp_path, session_id=saved)
 
-    options = agent._options(continuity=False, fork=True)
+    options = make(session_id=saved)._options(continuity=False, fork=True)
 
     assert options.resume == saved
     assert options.fork_session is True
 
 
-def test_clean_context_controls_safe_mode(tmp_path: Path) -> None:
-    """Proves clean_context is what puts --safe-mode on the command line."""
-    profile = tmp_path / "p.md"
-    profile.write_text("x", encoding="utf-8")
-
-    assert "safe-mode" in _options_for(Agent("a", profile, cwd=tmp_path)).extra_args
-    assert "safe-mode" not in _options_for(
-        Agent("a", profile, cwd=tmp_path, clean_context=False)
-    ).extra_args
+def test_safe_mode_controls_the_flag(make) -> None:
+    """Proves safe_mode is what puts --safe-mode on the command line."""
+    assert "safe-mode" in _options_for(make()).extra_args
+    assert "safe-mode" not in _options_for(make(safe_mode=False)).extra_args
 
 
-def test_effort_reaches_the_options(tmp_path: Path) -> None:
+def test_effort_reaches_the_options(make) -> None:
     """Proves an effort level is passed to the SDK as its CLI string."""
-    profile = tmp_path / "p.md"
-    profile.write_text("x", encoding="utf-8")
-
-    options = _options_for(Agent("a", profile, cwd=tmp_path, effort=Effort.HIGH))
-
-    assert options.effort == "high"
+    assert _options_for(make(effort=Effort.HIGH)).effort == "high"
 
 
-def test_max_turns_reaches_the_options(tmp_path: Path) -> None:
-    """Proves a turn limit is passed to the SDK unchanged."""
-    profile = tmp_path / "p.md"
-    profile.write_text("x", encoding="utf-8")
+def test_each_message_is_logged_as_it_arrives(make, tmp_path: Path, monkeypatch) -> None:
+    """Proves the log file holds each message before the turn ends, so it can be watched."""
+    seen_in_log: list[str] = []
+    log_dir = tmp_path / "logs"
 
-    options = _options_for(Agent("a", profile, cwd=tmp_path, max_turns=5))
+    async def fake_query(prompt, options):
+        yield _result(result="first")
+        # read the log while the turn is still running
+        seen_in_log.append(next(log_dir.iterdir()).read_text(encoding="utf-8"))
+        yield _result(result="second")
 
-    assert options.max_turns == 5
+    monkeypatch.setattr("rooster.agent.query", fake_query)
+    result = make().run_fresh("hi")
+
+    assert '"result": "first"' in seen_in_log[0]
+    log = result["log_path"].read_text(encoding="utf-8")
+    assert log.index("--- options ---") < log.index("--- messages ---") < log.index("--- stderr ---")
+    assert '"result": "second"' in log
 
 
-def test_fallback_model_reaches_the_options(tmp_path: Path) -> None:
-    """Proves a fallback model is passed to the SDK unchanged."""
-    profile = tmp_path / "p.md"
-    profile.write_text("x", encoding="utf-8")
-
-    options = _options_for(Agent("a", profile, cwd=tmp_path, fallback_model="claude-haiku-4-5"))
-
-    assert options.fallback_model == "claude-haiku-4-5"
-
-
-def test_an_unknown_session_is_expired_without_running(tmp_path: Path) -> None:
+def test_an_unknown_session_is_expired_without_running(make, tmp_path: Path) -> None:
     """Proves a session the CLI does not hold is reported as expired before anything spawns."""
-    profile = tmp_path / "p.md"
-    profile.write_text("x", encoding="utf-8")
     gone = str(uuid.uuid4())
     # a cli_path that cannot run proves nothing spawned, since spawning it would raise
     fake_cli = tmp_path / "claude.exe"
     fake_cli.write_text("", encoding="utf-8")
-    agent = Agent("ghost", profile, cwd=tmp_path, session_id=gone, cli_path=fake_cli)
+    agent = make(session_id=gone, cli_path=fake_cli)
 
     result = agent.run("Anything.")
 
@@ -341,11 +345,9 @@ def test_an_unknown_session_is_expired_without_running(tmp_path: Path) -> None:
     assert agent.session_id == gone
 
 
-def test_total_tokens_counts_cache_traffic(tmp_path: Path) -> None:
+def test_total_tokens_counts_cache_traffic(make) -> None:
     """Proves the running total includes cache reads, which a resumed turn arrives as."""
-    profile = tmp_path / "p.md"
-    profile.write_text("x", encoding="utf-8")
-    agent = Agent("a", profile, cwd=tmp_path)
+    agent = make()
 
     # a resumed turn's context is nearly all cache reads; counting only input plus
     # output would report 11 tokens for an exchange that actually moved almost 6,000

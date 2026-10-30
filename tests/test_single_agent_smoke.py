@@ -15,7 +15,7 @@ HELLO_PROFILE = Path(__file__).parent / "agents" / "hello.md"
 @pytest.mark.live
 def test_the_hello_agent_says_hello(tmp_path: Path) -> None:
     """Runs the simplest possible agent and checks it said exactly what its profile told it to."""
-    agent = Agent("hello", HELLO_PROFILE, cwd=tmp_path, allowed_tools=Tool.NONE)
+    agent = Agent("hello", HELLO_PROFILE, cwd=tmp_path, log_dir=tmp_path / "logs", tools=Tool.NONE)
 
     result = agent.run("Go.")
 

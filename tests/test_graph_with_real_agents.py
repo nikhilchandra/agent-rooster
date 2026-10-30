@@ -16,8 +16,9 @@ pytestmark = pytest.mark.live
 
 def test_hello_and_goodbye_alternate_until_the_round_count_is_met(tmp_path: Path) -> None:
     """Proves the graph hands control back and forth between two agents until a count is met."""
-    hello = Agent("hello", AGENTS / "hello.md", cwd=tmp_path, allowed_tools=Tool.NONE)
-    goodbye = Agent("goodbye", AGENTS / "goodbye.md", cwd=tmp_path, allowed_tools=Tool.NONE)
+    logs = tmp_path / "logs"
+    hello = Agent("hello", AGENTS / "hello.md", cwd=tmp_path, log_dir=logs, tools=Tool.NONE)
+    goodbye = Agent("goodbye", AGENTS / "goodbye.md", cwd=tmp_path, log_dir=logs, tools=Tool.NONE)
 
     graph = AgentGraph(
         "greeting",
