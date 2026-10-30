@@ -228,6 +228,23 @@ class Agent:
         self._record(result)
         return result
 
+    def run_forked(self, prompt: str) -> dict:
+        """Runs arun_forked() synchronously, as run() does for arun()."""
+        return asyncio.run(self.arun_forked(prompt))
+
+    async def arun_forked(self, prompt: str) -> dict:
+        """Asks a side question against a copy of this agent's memory, without moving its
+        own session forward.
+
+        Requires a prior run() to fork from, and returns a failed result if there is none.
+        The forked session's id comes back in the result's "session_id" and is not kept.
+        """
+        if not self.session_id:
+            return self._failed("run_forked requires a prior run() to fork from")
+        result = await self._invoke(prompt, continuity=False, fork=True)
+        self._record(result)
+        return result
+
     def _record(self, result: dict) -> None:
         """Files a result and adds its usage to this agent's running totals."""
         self.results.append(result)
@@ -238,9 +255,15 @@ class Agent:
         """Forgets the session so the next run starts a fresh conversation."""
         self.session_id = None
 
-    def _options(self, *, continuity: bool, stderr: list[str] | None = None) -> ClaudeAgentOptions:
+    def _options(
+        self, *, continuity: bool, fork: bool = False, stderr: list[str] | None = None
+    ) -> ClaudeAgentOptions:
         """Assembles the SDK options for one turn, collecting the CLI's stderr lines into
-        'stderr' when a list is given."""
+        'stderr' when a list is given.
+
+        Given 'fork', the turn resumes a copy of this agent's session under a new id, and
+        the session itself is left as it was.
+        """
         builtin = _cli_names(self.allowed_tools)
         available = list(builtin)
         for rule in self.extra_allowed_tools:
@@ -272,7 +295,8 @@ class Agent:
             ),
             max_budget_usd=self.max_work_usd,
             # one rule, no state: rejoin a session we have, and let the CLI mint one when we do not
-            resume=self.session_id if continuity and self.session_id else None,
+            resume=self.session_id if (continuity or fork) and self.session_id else None,
+            fork_session=fork,
             cwd=self.cwd,
             cli_path=self.cli_path,
             extra_args=extra_args,
@@ -349,15 +373,15 @@ class Agent:
             session_expired=True,
         )
 
-    async def _invoke(self, prompt: str, *, continuity: bool) -> dict:
+    async def _invoke(self, prompt: str, *, continuity: bool, fork: bool = False) -> dict:
         """Runs the CLI once through the SDK and turns whatever came back into a result."""
         # a session that is gone costs nothing to discover, so check before spawning anything
-        if continuity and self.session_id and not self._session_exists():
+        if (continuity or fork) and self.session_id and not self._session_exists():
             return self._expired()
 
         stderr: list[str] = []
         messages: list[Any] = []
-        options = self._options(continuity=continuity, stderr=stderr)
+        options = self._options(continuity=continuity, fork=fork, stderr=stderr)
         error: str | None = None
 
         try:

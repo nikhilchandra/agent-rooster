@@ -206,6 +206,19 @@ def test_run_fresh_never_touches_the_session(tmp_path: Path) -> None:
     assert agent.session_id == saved
 
 
+def test_a_fork_resumes_a_copy_of_the_session(tmp_path: Path) -> None:
+    """Proves a forked turn resumes this agent's session and asks the CLI to copy it."""
+    profile = tmp_path / "p.md"
+    profile.write_text("x", encoding="utf-8")
+    saved = "28aff200-76ed-4718-a98a-0d67857acbb5"
+    agent = Agent("a", profile, cwd=tmp_path, session_id=saved)
+
+    options = agent._options(continuity=False, fork=True)
+
+    assert options.resume == saved
+    assert options.fork_session is True
+
+
 def test_clean_context_controls_safe_mode(tmp_path: Path) -> None:
     """Proves clean_context is what puts --safe-mode on the command line."""
     profile = tmp_path / "p.md"

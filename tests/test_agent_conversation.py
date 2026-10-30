@@ -113,6 +113,32 @@ def test_session_continues_across_calls(workspace: Path, plain_profile: Path) ->
     print(f"total across both turns: {agent.total_tokens} tokens, ${agent.total_cost_usd:.4f}")
 
 
+def test_a_forked_question_remembers_without_moving_the_session(
+    workspace: Path, plain_profile: Path
+) -> None:
+    """Proves a forked turn sees the agent's memory and leaves its own session where it was."""
+    agent = Agent("memory", plain_profile, cwd=workspace, allowed_tools=Tool.NONE)
+    opening = agent.run("Remember the number 77. Reply with exactly: stored")
+    assert opening["ok"], opening["failure"]
+    before = agent.session_id
+
+    result = agent.run_forked("What number did I ask you to remember? Reply with just the number.")
+
+    assert result["ok"], result["failure"]
+    assert "77" in result["text"]
+    assert result["session_id"] != before
+    assert agent.session_id == before
+
+
+def test_a_fork_with_nothing_to_fork_from_fails(workspace: Path, plain_profile: Path) -> None:
+    """Proves forking an agent that has never run fails before any CLI call."""
+    agent = Agent("new", plain_profile, cwd=workspace, allowed_tools=Tool.NONE)
+
+    result = agent.run_forked("Anything.")
+
+    assert result["ok"] is False
+    assert agent.session_id is None
+
 
 
 def test_a_second_agent_object_resumes_the_first(workspace: Path, plain_profile: Path) -> None:
