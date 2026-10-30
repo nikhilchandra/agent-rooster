@@ -200,12 +200,13 @@ def _as_loggable(message: Any) -> dict:
 class Agent:
     """Holds one agent's identity and permissions, and runs it on demand.
 
-    run() and run_fresh() block until the turn ends. arun() and arun_fresh() do the same for
+    An agent either remembers its earlier turns or starts every turn fresh, as 'remembers'
+    sets once for all its turns. run() blocks until the turn ends. arun() does the same for
     async callers, so several agents can run at once, as in
-    asyncio.gather(a.arun_fresh(p), b.arun_fresh(p)). One agent must not run two turns at
-    once, since both would share its one session.
+    asyncio.gather(a.arun(p), b.arun(p)). One agent must not run two turns at once, since
+    both would share its one session.
 
-    Every run method returns a result dict with these keys:
+    run() and arun() return a result dict with these keys:
         ok: True when the turn completed and, given a schema, its reply fit the schema.
         text: The reply's text.
         data: The reply as an instance of the schema class when a schema is set, otherwise
@@ -230,6 +231,7 @@ class Agent:
         *,
         cwd: Path,
         log_dir: Path,
+        remembers: bool = False,
         model: Model | str = Model.SONNET,
         effort: Effort | str | None = None,
         tools: Tool = Tool.INSPECT,
@@ -254,6 +256,9 @@ class Agent:
             cwd: The folder that the agent works in.
             log_dir: The folder for this agent's log files, one per turn. Each file is
                 written line by line while the turn runs, so it can be watched live.
+            remembers: True continues one conversation across all of this agent's turns.
+                False starts every turn fresh, so the prompt must carry everything the agent
+                needs.
             model: A Model, or a full model ID as a plain string.
             effort: How much the model thinks, from Effort.LOW to Effort.MAX. None leaves the
                 CLI's default.
@@ -274,7 +279,8 @@ class Agent:
                 skills.
             permission_mode: The CLI's permission mode. The default lets file edits through
                 without asking, unless 'editable' is given.
-            session_id: A session to resume, saved from an earlier run.
+            session_id: A session to resume, saved from an earlier run. It is used only when
+                'remembers' is True.
             cli_path: The claude executable. None lets the SDK find the CLI, first in its own
                 bundled copy and then on PATH. A missing CLI is only discovered on the first
                 run, where it raises AgentError.
@@ -301,6 +307,7 @@ class Agent:
         self.profile = profile
         self.cwd = cwd
         self.log_dir = log_dir
+        self.remembers = remembers
         self.model = model
         self.effort = effort
         self.tools = tools
@@ -324,10 +331,10 @@ class Agent:
         self.total_tokens = 0
 
     def run(self, prompt: str) -> dict:
-        """Runs a turn in this agent's own session, so it remembers its earlier turns.
+        """Runs one turn and blocks until it ends.
 
-        Blocks until the turn ends. It cannot be called from inside a running event loop,
-        where arun() is the one to await instead.
+        It cannot be called from inside a running event loop, where arun() is the one to
+        await instead.
 
         Args:
             prompt: The message to send.
@@ -337,19 +344,8 @@ class Agent:
         """
         return asyncio.run(self.arun(prompt))
 
-    def run_fresh(self, prompt: str) -> dict:
-        """Runs a throwaway turn with no memory, leaving this agent's session untouched.
-
-        Args:
-            prompt: The message to send.
-
-        Returns:
-            The turn's result dict, with the keys that the Agent class docstring lists.
-        """
-        return asyncio.run(self.arun_fresh(prompt))
-
     async def arun(self, prompt: str) -> dict:
-        """Runs a turn in this agent's own session, as run() does, for async callers.
+        """Runs one turn, as run() does, for async callers.
 
         Args:
             prompt: The message to send.
@@ -357,40 +353,18 @@ class Agent:
         Returns:
             The turn's result dict, with the keys that the Agent class docstring lists.
         """
-        result = await self._invoke(prompt, continuity=True)
-        self._record(result)
+        result = await self._invoke(prompt)
+        self.total_cost_usd += result["cost_usd"]
+        self.total_tokens += result["total_tokens"]
         # adopt whatever session the CLI used, so every later turn rejoins this conversation
-        if result["ok"] and result["session_id"]:
+        if self.remembers and result["ok"] and result["session_id"]:
             self.session_id = result["session_id"]
         return result
 
-    async def arun_fresh(self, prompt: str) -> dict:
-        """Runs a throwaway turn, as run_fresh() does, for async callers.
-
-        Args:
-            prompt: The message to send.
-
-        Returns:
-            The turn's result dict, with the keys that the Agent class docstring lists.
-        """
-        result = await self._invoke(prompt, continuity=False)
-        self._record(result)
-        return result
-
-    def _record(self, result: dict) -> None:
-        """Adds a finished turn's cost and tokens to this agent's running totals.
-
-        Args:
-            result: A finished turn's result dict.
-        """
-        self.total_cost_usd += result["cost_usd"]
-        self.total_tokens += result["total_tokens"]
-
-    def _options(self, *, continuity: bool, stderr: list[str] | None = None) -> ClaudeAgentOptions:
+    def _options(self, *, stderr: list[str] | None = None) -> ClaudeAgentOptions:
         """Assembles the SDK options for one turn.
 
         Args:
-            continuity: True resumes this agent's session when it has one.
             stderr: A list that collects the CLI's stderr lines. None discards them.
 
         Returns:
@@ -441,7 +415,7 @@ class Agent:
             max_budget_usd=self.max_work_usd,
             effort=str(self.effort) if self.effort is not None else None,
             # one rule, no state: rejoin a session we have, and let the CLI mint one when we do not
-            resume=self.session_id if continuity and self.session_id else None,
+            resume=self.session_id if self.remembers and self.session_id else None,
             cwd=self.cwd,
             cli_path=self.cli_path,
             extra_args=extra_args,
@@ -506,7 +480,7 @@ class Agent:
         result.update(extra)
         return result
 
-    async def _invoke(self, prompt: str, *, continuity: bool) -> dict:
+    async def _invoke(self, prompt: str) -> dict:
         """Runs the CLI once through the SDK and turns whatever came back into a result.
 
         A turn whose session has expired is never retried on a fresh session. A prompt
@@ -515,7 +489,6 @@ class Agent:
 
         Args:
             prompt: The message to send.
-            continuity: True resumes this agent's session when it has one.
 
         Returns:
             The turn's result dict, with the keys that the Agent class docstring lists.
@@ -526,7 +499,7 @@ class Agent:
         expired = f"the session {self.session_id} has expired or was deleted"
         # a session that is gone costs nothing to discover, so check before spawning anything
         if (
-            continuity
+            self.remembers
             and self.session_id
             and get_session_info(self.session_id, directory=str(self.cwd)) is None
         ):
@@ -534,7 +507,7 @@ class Agent:
 
         stderr: list[str] = []
         messages: list[Any] = []
-        options = self._options(continuity=continuity, stderr=stderr)
+        options = self._options(stderr=stderr)
         error: str | None = None
         log_path, log = self._open_log(options)
 
@@ -563,7 +536,7 @@ class Agent:
         if final is not None:
             return self._parse(final, log_path)
         # backstop for a session that vanished between the check above and the spawn
-        if continuity and any("No conversation found with session ID" in line for line in stderr):
+        if self.remembers and any("No conversation found with session ID" in line for line in stderr):
             return self._failed(expired, log_path, session_expired=True)
         return self._failed(error or "the CLI produced no result", log_path)
 

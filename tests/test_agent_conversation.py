@@ -94,7 +94,8 @@ def test_schema_returns_an_instance(workspace: Path, logs: Path, plain_profile: 
 
 def test_session_continues_across_calls(workspace: Path, logs: Path, plain_profile: Path) -> None:
     """Proves a second run rejoins the first, so the agent remembers its own turns."""
-    agent = Agent("memory", plain_profile, cwd=workspace, log_dir=logs, tools=Tool.NONE)
+    agent = Agent("memory", plain_profile, cwd=workspace, log_dir=logs, remembers=True,
+                  tools=Tool.NONE)
 
     first = agent.run("Remember the number 41. Reply with exactly: stored")
     assert first["ok"], first["failure"]
@@ -112,7 +113,7 @@ def test_session_continues_across_calls(workspace: Path, logs: Path, plain_profi
 
 
 def test_two_agents_run_at_the_same_time(workspace: Path, logs: Path, plain_profile: Path) -> None:
-    """Proves arun_fresh lets two agents work at once, so the second starts before the first
+    """Proves arun lets two agents work at once, so the second starts before the first
     finishes."""
     first = Agent("first", plain_profile, cwd=workspace, log_dir=logs, model=Model.HAIKU,
                   tools=Tool.NONE)
@@ -122,7 +123,7 @@ def test_two_agents_run_at_the_same_time(workspace: Path, logs: Path, plain_prof
     async def timed(agent: Agent) -> tuple[float, float, dict]:
         """Returns when the agent's turn started and ended, in seconds, and its result."""
         start = time.monotonic()
-        result = await agent.arun_fresh("Reply with exactly: ok")
+        result = await agent.arun("Reply with exactly: ok")
         return start, time.monotonic(), result
 
     async def both() -> list:
@@ -142,15 +143,16 @@ def test_a_second_agent_object_resumes_the_first(
     workspace: Path, logs: Path, plain_profile: Path
 ) -> None:
     """Proves a rebuilt agent rejoins the conversation, which is what surviving a gate needs."""
-    first = Agent("memory", plain_profile, cwd=workspace, log_dir=logs, tools=Tool.NONE)
+    first = Agent("memory", plain_profile, cwd=workspace, log_dir=logs, remembers=True,
+                  tools=Tool.NONE)
     opening = first.run("Remember the number 63. Reply with exactly: stored")
     assert opening["ok"], opening["failure"]
     saved_id = first.session_id
     assert saved_id
 
     # a separate object, exactly as a later process would build it after a gate
-    second = Agent("memory", plain_profile, cwd=workspace, log_dir=logs, tools=Tool.NONE,
-                   session_id=saved_id)
+    second = Agent("memory", plain_profile, cwd=workspace, log_dir=logs, remembers=True,
+                   tools=Tool.NONE, session_id=saved_id)
     result = second.run("What number did I ask you to remember? Reply with just the number.")
 
     assert result["ok"], result["failure"]
@@ -163,8 +165,8 @@ def test_an_expired_session_is_reported_and_costs_nothing(
 ) -> None:
     """Proves a vanished session is named as such rather than silently replaced."""
     gone = "00000000-0000-4000-8000-000000000000"
-    agent = Agent("ghost", plain_profile, cwd=workspace, log_dir=logs, tools=Tool.NONE,
-                  session_id=gone)
+    agent = Agent("ghost", plain_profile, cwd=workspace, log_dir=logs, remembers=True,
+                  tools=Tool.NONE, session_id=gone)
 
     result = agent.run("Anything.")
 

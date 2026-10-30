@@ -36,8 +36,8 @@ def make(tmp_path: Path):
 
 
 def _options_for(agent: Agent) -> ClaudeAgentOptions:
-    """Builds a first-turn set of options for inspection."""
-    return agent._options(continuity=True)
+    """Builds a turn's options for inspection."""
+    return agent._options()
 
 
 def _result(**fields) -> ResultMessage:
@@ -251,26 +251,39 @@ def test_a_new_agent_asks_for_no_particular_session(make) -> None:
     assert options.resume is None
 
 
-def test_an_agent_holding_an_id_always_resumes(make) -> None:
-    """Proves a saved id means rejoin, which is what makes a run survive a human gate."""
+def test_a_remembering_agent_holding_an_id_resumes(make) -> None:
+    """Proves a saved id means rejoin, which is what makes a job survive a gate."""
     saved = "28aff200-76ed-4718-a98a-0d67857acbb5"
 
-    options = _options_for(make(session_id=saved))
+    options = _options_for(make(session_id=saved, remembers=True))
 
     # a session_id on an existing session is rejected as "already in use", so it must never be set
     assert options.resume == saved
     assert options.session_id is None
 
 
-def test_run_fresh_never_touches_the_session(make) -> None:
-    """Proves a throwaway turn leaves the agent's own conversation alone."""
-    saved = "28aff200-76ed-4718-a98a-0d67857acbb5"
-    agent = make(session_id=saved)
+def test_an_agent_that_does_not_remember_never_resumes(make) -> None:
+    """Proves an agent left at the default starts every turn fresh, even holding an id."""
+    agent = make(session_id="28aff200-76ed-4718-a98a-0d67857acbb5")
 
-    options = agent._options(continuity=False)
+    assert agent.remembers is False
+    assert _options_for(agent).resume is None
 
-    assert options.resume is None
-    assert agent.session_id == saved
+
+def test_an_agent_that_does_not_remember_keeps_no_session(make, monkeypatch) -> None:
+    """Proves a fresh turn's session id is not adopted, so no later turn can rejoin it."""
+
+    async def fake_query(prompt, options):
+        yield _result(session_id="minted")
+
+    monkeypatch.setattr("rooster.agent.query", fake_query)
+    forgetful, remembering = make(), make(remembers=True)
+
+    forgetful.run("hi")
+    remembering.run("hi")
+
+    assert forgetful.session_id is None
+    assert remembering.session_id == "minted"
 
 
 def test_safe_mode_controls_the_flag(make) -> None:
@@ -296,7 +309,7 @@ def test_each_message_is_logged_as_it_arrives(make, tmp_path: Path, monkeypatch)
         yield _result(result="second")
 
     monkeypatch.setattr("rooster.agent.query", fake_query)
-    result = make().run_fresh("hi")
+    result = make().run("hi")
 
     assert '"result": "first"' in seen_in_log[0]
     log = result["log_path"].read_text(encoding="utf-8")
@@ -310,7 +323,7 @@ def test_an_unknown_session_is_expired_without_running(make, tmp_path: Path) -> 
     # a cli_path that cannot run proves nothing spawned, since spawning it would raise
     fake_cli = tmp_path / "claude.exe"
     fake_cli.write_text("", encoding="utf-8")
-    agent = make(session_id=gone, cli_path=fake_cli)
+    agent = make(session_id=gone, cli_path=fake_cli, remembers=True)
 
     result = agent.run("Anything.")
 
@@ -320,21 +333,19 @@ def test_an_unknown_session_is_expired_without_running(make, tmp_path: Path) -> 
     assert agent.session_id == gone
 
 
-def test_total_tokens_counts_cache_traffic(make) -> None:
+def test_total_tokens_counts_cache_traffic(make, monkeypatch) -> None:
     """Proves the running total includes cache reads, which a resumed turn arrives as."""
+    # a resumed turn's context is nearly all cache reads, so counting only input plus
+    # output would report 11 tokens for an exchange that actually moved almost 6,000
+    usage = {"input_tokens": 4, "output_tokens": 7, "cache_read_input_tokens": 5910}
+
+    async def fake_query(prompt, options):
+        yield _result(usage=usage)
+
+    monkeypatch.setattr("rooster.agent.query", fake_query)
     agent = make()
 
-    # a resumed turn's context is nearly all cache reads; counting only input plus
-    # output would report 11 tokens for an exchange that actually moved almost 6,000
-    agent._record(
-        {
-            "cost_usd": 0.01,
-            "input_tokens": 4,
-            "output_tokens": 7,
-            "cache_read_tokens": 5910,
-            "cache_write_tokens": 0,
-            "total_tokens": 4 + 7 + 5910,
-        }
-    )
+    result = agent.run("hi")
 
+    assert result["total_tokens"] == 5921
     assert agent.total_tokens == 5921
