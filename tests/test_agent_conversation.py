@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
 from rooster import Agent, Model, Tool
+from rooster.agent import _ALIASES, _CLI_NAMES
 
 pytestmark = pytest.mark.live
 
@@ -164,6 +166,35 @@ def test_a_prompt_longer_than_the_windows_command_line_works(
 
     assert result["ok"], result["failure"]
     assert result["text"].strip() == "ok"
+
+
+def test_full_provides_every_named_tool(workspace: Path, plain_profile: Path) -> None:
+    """Proves the CLI starts with every tool that Tool.FULL names, so none is silently
+    dropped as a name the CLI no longer knows."""
+    agent = Agent(
+        "full",
+        plain_profile,
+        cwd=workspace,
+        model=Model.HAIKU,
+        allowed_tools=Tool.FULL,
+        log_dir=workspace / "logs",
+    )
+
+    result = agent.run("Reply with exactly: ok")
+
+    assert result["ok"], result["failure"]
+    # read the logged messages, one JSON object per line between their two section markers
+    log = result["log_path"].read_text(encoding="utf-8")
+    section = log.split("--- messages ---\n", 1)[1].split("\n--- stderr ---", 1)[0]
+    messages = [json.loads(line) for line in section.splitlines() if line.strip()]
+
+    # the init message lists the tools the CLI actually started with
+    init = next(
+        m for m in messages if m["type"] == "SystemMessage" and m.get("subtype") == "init"
+    )
+    started = {_ALIASES.get(name, name) for name in init["data"]["tools"]}
+    missing = set(_CLI_NAMES.values()) - started
+    assert not missing, f"the CLI did not start with {sorted(missing)}"
 
 
 def test_a_timeout_is_reported_as_a_failure(workspace: Path, plain_profile: Path) -> None:

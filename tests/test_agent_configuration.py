@@ -9,6 +9,7 @@ import pytest
 from claude_agent_sdk import ClaudeAgentOptions
 
 from rooster import Agent, AgentError, Model, PermissionMode, Tool
+from rooster.agent import _CLI_NAMES
 
 
 def test_missing_profile_raises(tmp_path: Path) -> None:
@@ -31,6 +32,35 @@ def test_tool_flags_compose() -> None:
     assert Tool.EDIT not in Tool.INSPECT
     assert Tool.EDIT in Tool.AUTHOR
     assert Tool.BASH not in (Tool.FULL & ~Tool.BASH)
+
+
+def test_every_tool_has_a_cli_name_and_full_holds_them_all() -> None:
+    """Proves no single tool is left without a CLI name, and that Tool.FULL grants each one."""
+    # the single-bit members, skipping NONE, the composites and any alias of an earlier member
+    singles = {
+        member
+        for member in Tool.__members__.values()
+        if member.value and member.value & (member.value - 1) == 0
+    }
+    assert singles <= _CLI_NAMES.keys(), singles - _CLI_NAMES.keys()
+
+    every = Tool.NONE
+    for member in singles:
+        every |= member
+    assert Tool.FULL == every
+
+
+def test_full_asks_for_agent_and_no_retired_name(tmp_path: Path) -> None:
+    """Proves Tool.FULL asks the CLI for Agent, and for neither Task nor TodoWrite."""
+    profile = tmp_path / "p.md"
+    profile.write_text("x", encoding="utf-8")
+
+    tools = Agent("a", profile, cwd=tmp_path, allowed_tools=Tool.FULL)._options(continuity=True).tools
+
+    assert "Agent" in tools
+    assert "Task" not in tools
+    assert "TodoWrite" not in tools
+    assert len(tools) == len(set(tools))
 
 
 def test_enums_are_their_cli_strings() -> None:

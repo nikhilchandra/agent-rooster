@@ -35,15 +35,15 @@ class Tool(Flag):
     BASH = auto()
     GLOB = auto()
     GREP = auto()
-    TASK = auto()
-    TODO = auto()
+    AGENT = auto()
+    TASK = AGENT # the name from before CLI 2.1.63
     WEB_FETCH = auto()
     WEB_SEARCH = auto()
 
     # composites, so a caller writes the intent rather than assembling it every time
     INSPECT = READ | GLOB | GREP
     AUTHOR = READ | GLOB | GREP | WRITE | EDIT
-    FULL = READ | GLOB | GREP | WRITE | EDIT | BASH | TASK | TODO | WEB_FETCH | WEB_SEARCH
+    FULL = READ | GLOB | GREP | WRITE | EDIT | BASH | AGENT | WEB_FETCH | WEB_SEARCH
 
 
 class PermissionMode(StrEnum):
@@ -74,11 +74,13 @@ _CLI_NAMES: dict[Tool, str] = {
     Tool.BASH: "Bash",
     Tool.GLOB: "Glob",
     Tool.GREP: "Grep",
-    Tool.TASK: "Task",
-    Tool.TODO: "TodoWrite",
+    Tool.AGENT: "Agent",
     Tool.WEB_FETCH: "WebFetch",
     Tool.WEB_SEARCH: "WebSearch",
 }
+
+# maps an old name that the CLI's init message may still report to the name in _CLI_NAMES
+_ALIASES: dict[str, str] = {"Task": "Agent"}
 
 
 def _cli_names(tools: Tool) -> list[str]:
