@@ -263,6 +263,34 @@ def test_a_raising_observer_leaves_the_result_intact(workspace: Path, plain_prof
     assert result["ok"] is True, result["failure"]
 
 
+def test_a_permission_policy_refuses_a_tool(workspace: Path, plain_profile: Path) -> None:
+    """Proves a permission_policy that refuses Bash stops a Bash call, even though
+    allowed_tools names Bash, and that the refusal is reported in the result."""
+    asked: list[str] = []
+
+    def no_bash(tool_name: str, tool_input: dict) -> bool | tuple[bool, str]:
+        asked.append(tool_name)
+        if tool_name == "Bash":
+            return False, "Bash is not permitted for this agent"
+        return True
+
+    agent = Agent("guarded", plain_profile, cwd=workspace,
+                  allowed_tools=Tool.BASH | Tool.READ, permission_policy=no_bash)
+
+    # not `echo`, which the CLI treats as read-only and approves before any policy is asked
+    result = agent.run(
+        'Use the Bash tool to run exactly: python -c "print(6*7)"  then tell me what it '
+        "printed. If the tool call is refused, say so plainly and do not guess the output."
+    )
+
+    assert result["ok"], result["failure"]
+    assert "Bash" in asked
+    assert result["denials"], "the policy refused Bash but no denial was reported"
+    assert any(d["tool_name"] == "Bash" for d in result["denials"])
+    # the command never ran, so its output cannot be in the reply
+    assert "42" not in result["text"]
+
+
 def test_transcript_holds_a_tool_call_and_its_result(workspace: Path, plain_profile: Path) -> None:
     """Proves the transcript records a tool call and the result that answered it."""
     agent = Agent("shell", plain_profile, cwd=workspace, allowed_tools=Tool.BASH)
