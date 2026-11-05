@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from pathlib import Path
 
 import pytest
-from claude_agent_sdk import ClaudeAgentOptions, ResultMessage
+from claude_agent_sdk import ClaudeAgentOptions, HookMatcher, ResultMessage
 from pydantic import BaseModel
 
 from rooster import Agent, AgentError, Command, Effort, Model, PermissionMode, Tool
@@ -218,6 +219,116 @@ def test_hidden_absolute_paths_use_the_cli_absolute_form(make) -> None:
     assert options.disallowed_tools == ["Read(//d/work/.ratchet/**)"]
 
 
+_FORBIDDEN = ("--no-index", "--output", "-C")
+
+
+def _decide(agent: Agent, command: str, tool_name: str = "Bash") -> dict:
+    """Runs the agent's PreToolUse hook on one tool call, given its 'tool_name' and the Bash
+    'command', and returns the hook's answer."""
+    callback = _options_for(agent).hooks["PreToolUse"][0].hooks[0]
+    input_data = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": tool_name,
+        "tool_input": {"command": command},
+        "tool_use_id": "t",
+        "session_id": "s",
+        "transcript_path": "",
+        "cwd": "",
+    }
+    return asyncio.run(callback(input_data, "t", {"signal": None}))
+
+
+def test_no_forbidden_options_sets_no_hooks(make) -> None:
+    """Proves an agent without 'forbidden_options' passes no PreToolUse hook, so agents built
+    before it existed are unchanged."""
+    hooks = _options_for(make(tools=Tool.BASH)).hooks
+
+    assert not hooks or "PreToolUse" not in hooks
+
+
+def test_forbidden_options_become_one_bash_pre_tool_use_hook(make) -> None:
+    """Proves 'forbidden_options' becomes a single PreToolUse matcher for Bash, holding one
+    callback."""
+    hooks = _options_for(make(tools=Tool.BASH, forbidden_options=("--no-index",))).hooks
+
+    matchers = hooks["PreToolUse"]
+    assert len(matchers) == 1
+    assert isinstance(matchers[0], HookMatcher)
+    assert matchers[0].matcher == "Bash"
+    assert len(matchers[0].hooks) == 1
+
+
+@pytest.mark.parametrize(
+    ("command", "option"),
+    [
+        ("git diff --no-index a b", "--no-index"),
+        ("git log && git diff --no-index a b", "--no-index"),
+        ("git diff --output=/tmp/x", "--output"),
+        ("git diff --outp /tmp/x", "--output"),
+        ("git -C /elsewhere status", "-C"),
+        ("git diff '--no-index' a b", "--no-index"),
+        ("git diff a b --no-index;true", "--no-index"),
+        ("git diff a b --no-index&&echo", "--no-index"),
+        ("git diff a b --no-index|cat", "--no-index"),
+        ("(git diff --no-index a b)", "--no-index"),
+    ],
+)
+def test_the_hook_refuses_a_forbidden_option_and_names_it(make, command: str, option: str) -> None:
+    """Proves the hook denies a Bash command holding a forbidden option, whether exact, quoted,
+    in a later part of a compound command, right against a shell operator, written as
+    "--opt=value", or shortened the way git accepts, and that the reason names the option."""
+    agent = make(tools=Tool.BASH, forbidden_options=_FORBIDDEN)
+
+    output = _decide(agent, command)["hookSpecificOutput"]
+
+    assert output["hookEventName"] == "PreToolUse"
+    assert output["permissionDecision"] == "deny"
+    assert option in output["permissionDecisionReason"]
+
+
+@pytest.mark.parametrize(
+    ("command", "tool_name"),
+    [
+        ("git log", "Bash"),
+        ("git diff --name-only", "Bash"),
+        # "--o" is under 4 characters, too short to count as a shortened "--output"
+        ("git diff --o x", "Bash"),
+        ("git diff --no-index-foo", "Bash"),
+        # short options are case-sensitive, so "-c" is not "-C"
+        ("git -c x=y log", "Bash"),
+        ("git diff --no-index a b", "Read"),
+    ],
+)
+def test_the_hook_allows_commands_without_a_forbidden_option(
+    make, command: str, tool_name: str
+) -> None:
+    """Proves the hook leaves alone a command with no forbidden option, a word that only
+    starts like one, a prefix too short to count, and any tool other than Bash."""
+    agent = make(tools=Tool.BASH | Tool.READ, forbidden_options=_FORBIDDEN)
+
+    assert _decide(agent, command, tool_name) == {}
+
+
+def test_a_turn_with_forbidden_options_passes_the_hook_to_query_and_logs(
+    make, monkeypatch
+) -> None:
+    """Proves a turn hands query the PreToolUse hook, and that the turn's log still records
+    its options with the hook among them."""
+    seen: list[ClaudeAgentOptions] = []
+
+    async def fake_query(prompt, options):
+        seen.append(options)
+        yield _result()
+
+    monkeypatch.setattr("rooster.agent.query", fake_query)
+    result = make(tools=Tool.BASH, forbidden_options=("--no-index",)).run("x")
+
+    assert seen[0].hooks["PreToolUse"][0].matcher == "Bash"
+    log = result["log_path"].read_text(encoding="utf-8")
+    assert "--- options ---" in log
+    assert "PreToolUse" in log.split("--- options ---", 1)[1].split("--- prompt ---", 1)[0]
+
+
 def test_editable_with_bypass_mode_raises(make) -> None:
     """Proves 'editable' fails at construction when bypass mode would skip its rules."""
     with pytest.raises(AgentError, match="BYPASS"):
@@ -396,3 +507,13 @@ def test_total_tokens_counts_cache_traffic(make, monkeypatch) -> None:
 
     assert result["total_tokens"] == 5921
     assert agent.total_tokens == 5921
+
+
+def test_the_hook_still_checks_a_command_with_an_unbalanced_quote(make) -> None:
+    """Proves a command that the shell parser cannot split is checked word by word, not let
+    through."""
+    agent = make(tools=Tool.BASH, forbidden_options=_FORBIDDEN)
+
+    output = _decide(agent, "git diff --no-index 'a b")["hookSpecificOutput"]
+
+    assert output["permissionDecision"] == "deny"

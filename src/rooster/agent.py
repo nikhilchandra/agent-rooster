@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import shlex
 from contextlib import aclosing
 from datetime import datetime, timezone
 from enum import Flag, StrEnum, auto
@@ -15,6 +16,7 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKError,
     CLINotFoundError,
+    HookMatcher,
     ResultMessage,
     get_session_info,
     query,
@@ -214,6 +216,72 @@ def _as_loggable(message: Any) -> dict:
     return {"type": type(message).__name__, **body}
 
 
+def _forbidden_option_in(command: str, forbidden: tuple[str, ...]) -> str | None:
+    """Finds the first forbidden option that a shell command uses.
+
+    A word matches an option when it is the option itself. For a long option, which starts
+    with "--", a word also matches when it is the option followed by "=" and a value, or when
+    it is a shortened form that git accepts: a word of at least 4 characters that starts with
+    "--" and is a prefix of the option, such as "--outp" for "--output".
+
+    Args:
+        command: The shell command, which may chain several commands.
+        forbidden: The option words to look for, such as ("--no-index", "-C").
+
+    Returns:
+        The first forbidden option that a word of 'command' matches, or None when none does.
+    """
+    # the shell's operators, such as ";", "&&" and "|", become words of their own, so an option
+    # written right against one is still a word by itself
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        words = list(lexer)
+    except ValueError:
+        # an unbalanced quote still gets checked, split on whitespace, rather than let through
+        words = command.split()
+    for word in words:
+        head = word.split("=", 1)[0]
+        for option in forbidden:
+            if word == option:
+                return option
+            if not option.startswith("--"):
+                continue
+            if head == option or (len(head) >= 4 and head.startswith("--") and option.startswith(head)):
+                return option
+    return None
+
+
+def _forbidden_options_hook(forbidden: tuple[str, ...]):
+    """Builds a PreToolUse hook that refuses a Bash command that uses a forbidden option.
+
+    Args:
+        forbidden: The option words that no Bash command may contain.
+
+    Returns:
+        An async callback in the SDK's hook form. It answers with a "deny" decision that names
+        the option, or with an empty dict to leave the call to the other permission rules.
+    """
+
+    async def refuse_forbidden_options(input_data, tool_use_id, context) -> dict:
+        if input_data["tool_name"] != "Bash":
+            return {}
+        option = _forbidden_option_in(input_data["tool_input"].get("command", ""), forbidden)
+        if option is None:
+            return {}
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    f"the option {option} is forbidden here, because it reaches outside the project"
+                ),
+            }
+        }
+
+    return refuse_forbidden_options
+
+
 class Agent:
     """Holds one agent's identity and permissions, and runs it on demand.
 
@@ -257,6 +325,7 @@ class Agent:
         editable: tuple[str, ...] = (),
         frozen: tuple[str, ...] = (),
         hidden: tuple[str, ...] = (),
+        forbidden_options: tuple[str, ...] = (),
         schema: type[BaseModel] | None = None,
         max_work_usd: float | None = None,
         timeout_s: int | None = None,
@@ -292,6 +361,10 @@ class Agent:
             hidden: Path patterns that the agent may never read, relative to 'cwd' or absolute,
                 such as "secrets/**" or a folder outside 'cwd'. Claude Code enforces them on
                 Read, Grep and Glob.
+            forbidden_options: Command-line option words that no Bash command may contain, such
+                as "--no-index" or "-C". A PreToolUse hook refuses them, even on calls that the
+                allow rules approve. A long option also catches its "=value" form and git's
+                shortened forms, such as "--outp" for "--output".
             schema: A pydantic class that the reply must fit. The reply then arrives as an
                 instance of it in the result's "data".
             max_work_usd: The most that one turn may spend, in dollars. None means no limit.
@@ -336,6 +409,7 @@ class Agent:
         self.editable = editable
         self.frozen = frozen
         self.hidden = hidden
+        self.forbidden_options = forbidden_options
         self.schema = schema
         self.max_work_usd = max_work_usd
         self.timeout_s = timeout_s
@@ -440,6 +514,12 @@ class Agent:
             effort=str(self.effort) if self.effort is not None else None,
             # one rule, no state: rejoin a session we have, and let the CLI mint one when we do not
             resume=self.session_id if self.remembers and self.session_id else None,
+            # a hook runs on every call, but an allow rule approves a call before can_use_tool is asked
+            hooks=(
+                {"PreToolUse": [HookMatcher(matcher="Bash", hooks=[_forbidden_options_hook(self.forbidden_options)])]}
+                if self.forbidden_options
+                else None
+            ),
             cwd=self.cwd,
             cli_path=self.cli_path,
             extra_args=extra_args,
