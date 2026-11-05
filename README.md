@@ -93,7 +93,8 @@ step it may go to with `next=`, so a typo is caught before any agent runs.
 
 - **A loop** is a step that returns an earlier step's name.
 - **A gate** is a step declared with `gate=True`. The job pauses after it until you call
-  `resume()`.
+  `resume()`. Pass `resume(slug, data={...})` to hand the job a decision, such as an
+  owner's answers. Each key is written into `job.data` before the next step runs.
 - **A check** is ordinary Python inside a step, such as running the tests, with no agent
   involved.
 

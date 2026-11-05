@@ -76,6 +76,27 @@ def test_resume_continues_from_the_next_step(graph: AgentGraph) -> None:
     assert resumed.data["tests"] == "tester says ok"
 
 
+def test_resume_hands_decisions_to_the_next_step(graph: AgentGraph) -> None:
+    """Proves data given to resume is in job.data for the step after the gate, and is saved."""
+    started = graph.start("a feature")
+
+    resumed = graph.resume(started.slug, data={"decision": "approve", "features": "edited"})
+
+    assert resumed.data["decision"] == "approve"
+    assert resumed.data["features"] == "edited"
+    assert graph.load(started.slug).data["decision"] == "approve"
+
+
+def test_resume_without_data_leaves_job_data_alone(graph: AgentGraph) -> None:
+    """Proves resume with an empty dict adds nothing to job.data."""
+    started = graph.start("a feature")
+    before = dict(started.data)
+
+    resumed = graph.resume(started.slug, data={})
+
+    assert {key: value for key, value in resumed.data.items() if key != "tests"} == before
+
+
 def test_session_ids_are_saved_and_handed_back(graph: AgentGraph) -> None:
     """Proves the graph carries agent sessions across a stop, which is the point of the gate."""
     started = graph.start("a feature")

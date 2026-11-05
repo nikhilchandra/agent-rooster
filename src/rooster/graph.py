@@ -277,11 +277,14 @@ class AgentGraph:
         self._save(job)
         return self._advance(job)
 
-    def resume(self, slug: str) -> Job:
+    def resume(self, slug: str, data: dict | None = None) -> Job:
         """Reloads a paused job, hands its sessions back to the agents, and continues it.
 
         Args:
             slug: The job's name.
+            data: Decisions made at the gate, such as an owner's answers. Each key is
+                written into 'job.data' before the next step runs, replacing any value
+                already under that key. None adds nothing.
 
         Returns:
             The job as it stands when it stopped advancing.
@@ -294,6 +297,9 @@ class AgentGraph:
         if job.finished:
             raise GraphError(f"job {slug!r} is already {job.status}, so there is nothing to resume")
         job.status = JobStatus.RUNNING
+        # merge the gate's decisions into the job's data
+        if data:
+            job.data.update(data)
         self._restore_sessions(job)
         return self._advance(job)
 
