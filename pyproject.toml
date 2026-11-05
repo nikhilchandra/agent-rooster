@@ -19,6 +19,8 @@ build-backend = "hatchling.build"
 packages = ["src/rooster"]
 
 [tool.pytest.ini_options]
+# the live tests call the claude CLI and spend tokens, so they run only when asked for with -m live
+addopts = "-m 'not live'"
 markers = [
     "live: calls the claude CLI for real and spends tokens against your plan",
 ]
