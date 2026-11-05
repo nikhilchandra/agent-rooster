@@ -71,6 +71,7 @@ The settings, briefly:
 | `tools` | The built-in tools the agent may use, such as `Tool.INSPECT` (read only) or `Tool.AUTHOR` (read and edit). |
 | `commands` | The shell commands it may run, such as `Command.PYTEST`, `Command.GIT_MV`, `Command.GIT_RM` and `Command.GIT_READ`. `Tool.BASH` allows every command instead. |
 | `editable`, `frozen` | Path patterns it may change, such as `"src/**"`, and patterns it may never change, such as `"**/*.feature"`. Claude Code enforces both. |
+| `hidden` | Path patterns it may never read, such as an absolute folder outside `cwd`. Claude Code enforces them on Read, Grep and Glob. |
 | `schema` | A pydantic class that the reply must fit. The reply arrives as an instance of it in `result["data"]`, and a reply that does not fit makes `result["ok"]` False. |
 | `max_work_usd`, `timeout_s` | The most one turn may spend, in dollars, and the longest it may take, in seconds. |
 

@@ -190,6 +190,34 @@ def test_frozen_becomes_a_deny_rule(make) -> None:
     assert options.disallowed_tools == ["Edit(**/*.feature)"]
 
 
+def test_hidden_becomes_a_read_deny_rule(make) -> None:
+    """Proves each hidden pattern becomes a Read deny rule, after the frozen Edit rules, and that
+    Read, Grep and Glob stay available everywhere else."""
+    alone = _options_for(make(hidden=("secrets/**",)))
+    both = _options_for(make(tools=Tool.AUTHOR, frozen=("**/*.feature",), hidden=("secrets/**",)))
+
+    assert alone.disallowed_tools == ["Read(secrets/**)"]
+    assert both.disallowed_tools == ["Edit(**/*.feature)", "Read(secrets/**)"]
+    for options in (alone, both):
+        assert "Read" in options.allowed_tools
+        assert {"Read", "Grep", "Glob"} <= set(options.tools)
+        assert not {"Read", "Grep", "Glob"} & set(options.disallowed_tools)
+
+
+def test_hidden_absolute_paths_use_the_cli_absolute_form(make) -> None:
+    """Proves an absolute hidden path is written as "//" followed by the path, with a Windows
+    drive as a lowercase letter, and that a relative pattern is left as it is, on any system."""
+    from rooster.agent import _path_rule
+
+    assert _path_rule(r"C:\Users\a\proj\**") == "//c/Users/a/proj/**"
+    assert _path_rule("C:/Users/a/proj") == "//c/Users/a/proj"
+    assert _path_rule("/home/a/proj/**") == "//home/a/proj/**"
+    assert _path_rule("src/**") == "src/**"
+    assert _path_rule("src\\**") == "src\\**"
+    options = _options_for(make(hidden=(r"D:\work\.ratchet\**",)))
+    assert options.disallowed_tools == ["Read(//d/work/.ratchet/**)"]
+
+
 def test_editable_with_bypass_mode_raises(make) -> None:
     """Proves 'editable' fails at construction when bypass mode would skip its rules."""
     with pytest.raises(AgentError, match="BYPASS"):

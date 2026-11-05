@@ -8,7 +8,7 @@ import json
 from contextlib import aclosing
 from datetime import datetime, timezone
 from enum import Flag, StrEnum, auto
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import IO, Any
 
 from claude_agent_sdk import (
@@ -165,6 +165,23 @@ def _cli_names(tools: Tool) -> list[str]:
     return [_CLI_NAMES[bit] for bit in tools if bit in _CLI_NAMES]
 
 
+def _path_rule(pattern: str) -> str:
+    """Returns a path pattern in the form that a Claude Code permission rule reads.
+
+    A rule that starts with a single "/" is anchored at the settings file, and one that starts
+    with "//" is anchored at the filesystem root. So an absolute pattern gets a second "/", and
+    a Windows drive is written as a lowercase letter, which makes "C:/work/**" into
+    "//c/work/**" and "/home/x" into "//home/x". A relative pattern is returned unchanged and
+    stays anchored at the agent's 'cwd'.
+    """
+    drive = PureWindowsPath(pattern).drive
+    if len(drive) == 2 and drive[1] == ":":
+        return "//" + drive[0].lower() + pattern[2:].replace("\\", "/")
+    if pattern.startswith("/"):
+        return "/" + pattern
+    return pattern
+
+
 def _bash_rules(commands: Command) -> list[str]:
     """Converts a combination of command flags into the CLI's Bash permission rules.
 
@@ -239,6 +256,7 @@ class Agent:
         # mcp_tools: tuple[str, ...] = (),  # MCP tools such as "mcp__server__tool", not yet supported
         editable: tuple[str, ...] = (),
         frozen: tuple[str, ...] = (),
+        hidden: tuple[str, ...] = (),
         schema: type[BaseModel] | None = None,
         max_work_usd: float | None = None,
         timeout_s: int | None = None,
@@ -271,6 +289,9 @@ class Agent:
                 runs in PermissionMode.DONT_ASK in place of PermissionMode.ACCEPT_EDITS.
             frozen: Path patterns, relative to 'cwd', that the agent may never change, even
                 inside 'editable', such as "**/*.feature".
+            hidden: Path patterns that the agent may never read, relative to 'cwd' or absolute,
+                such as "secrets/**" or a folder outside 'cwd'. Claude Code enforces them on
+                Read, Grep and Glob.
             schema: A pydantic class that the reply must fit. The reply then arrives as an
                 instance of it in the result's "data".
             max_work_usd: The most that one turn may spend, in dollars. None means no limit.
@@ -314,6 +335,7 @@ class Agent:
         self.commands = commands
         self.editable = editable
         self.frozen = frozen
+        self.hidden = hidden
         self.schema = schema
         self.max_work_usd = max_work_usd
         self.timeout_s = timeout_s
@@ -405,8 +427,10 @@ class Agent:
             # tools sets what exists at all, so an empty list really does mean no tools
             tools=available,
             allowed_tools=pre_approved + bash_rules + path_rules,
-            # deny rules are checked before anything else, so a frozen path holds in every mode
-            disallowed_tools=[f"Edit({pattern})" for pattern in self.frozen],
+            # deny rules are checked before anything else, so a frozen or hidden path holds in every mode
+            # a Read rule also covers Grep and Glob, which have no path rules of their own
+            disallowed_tools=[f"Edit({pattern})" for pattern in self.frozen]
+            + [f"Read({_path_rule(pattern)})" for pattern in self.hidden],
             output_format=(
                 {"type": "json_schema", "schema": self.schema.model_json_schema()}
                 if self.schema is not None
