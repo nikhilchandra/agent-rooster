@@ -158,6 +158,8 @@ def test_a_command_pattern_also_matches_its_bare_command() -> None:
     assert "Bash(pytest)" in rules
     assert "Bash(uv run pytest)" in rules
     assert "Bash(git status)" in rules
+    assert "Bash(git blame *)" in rules
+    assert "Bash(git blame)" in rules
 
 
 def test_no_paths_leaves_edits_to_the_permission_mode(make) -> None:

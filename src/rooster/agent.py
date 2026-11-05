@@ -142,7 +142,7 @@ _COMMAND_PATTERNS: dict[Command, tuple[str, ...]] = {
     Command.PYTEST: ("pytest *", "uv run pytest *", "uv run --no-sync pytest *", "python -m pytest *"),
     Command.GIT_MV: ("git mv *",),
     Command.GIT_RM: ("git rm *",),
-    Command.GIT_READ: ("git status *", "git diff *", "git log *", "git show *"),
+    Command.GIT_READ: ("git status *", "git diff *", "git log *", "git show *", "git blame *"),
 }
 
 # the tools that change files, which only a path rule may approve once 'editable' is given
