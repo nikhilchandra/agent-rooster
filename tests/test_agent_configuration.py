@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import uuid
 from pathlib import Path
 
@@ -517,3 +518,187 @@ def test_the_hook_still_checks_a_command_with_an_unbalanced_quote(make) -> None:
     output = _decide(agent, "git diff --no-index 'a b")["hookSpecificOutput"]
 
     assert output["permissionDecision"] == "deny"
+
+
+def _decide_call(agent: Agent, tool_name: str, tool_input: dict) -> dict:
+    """Runs the agent's PreToolUse hook on one call of the tool 'tool_name' with the input
+    'tool_input', made in the agent's folder, and returns the hook's answer."""
+    callback = _options_for(agent).hooks["PreToolUse"][0].hooks[0]
+    input_data = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": tool_name,
+        "tool_input": tool_input,
+        "tool_use_id": "t",
+        "session_id": "s",
+        "transcript_path": "",
+        "cwd": str(agent.cwd),
+    }
+    return asyncio.run(callback(input_data, "t", {"signal": None}))
+
+
+def _denial_reason(answer: dict) -> str:
+    """Checks that a hook's answer denies the call, and returns the reason it gives."""
+    output = answer["hookSpecificOutput"]
+    assert output["hookEventName"] == "PreToolUse"
+    assert output["permissionDecision"] == "deny"
+    return output["permissionDecisionReason"]
+
+
+def _short_name(path: Path) -> str:
+    """Returns the Windows 8.3 short form of an existing path, such as C:\\X\\RATCHE~1 for
+    C:\\X\\.ratchet, or "" when Windows gives none."""
+    import ctypes
+
+    buffer = ctypes.create_unicode_buffer(1024)
+    ctypes.windll.kernel32.GetShortPathNameW(str(path), buffer, len(buffer))
+    return buffer.value
+
+
+def test_confined_to_makes_one_pre_tool_use_matcher_for_every_tool(make, tmp_path: Path) -> None:
+    """Proves 'confined_to' with 'forbidden_options' gives a single PreToolUse matcher that
+    matches every tool and holds one callback, and that the callback still refuses a forbidden
+    option."""
+    agent = make(tools=Tool.BASH | Tool.READ, confined_to=tmp_path,
+                 forbidden_options=("--no-index",))
+
+    matchers = _options_for(agent).hooks["PreToolUse"]
+
+    assert len(matchers) == 1
+    assert isinstance(matchers[0], HookMatcher)
+    assert matchers[0].matcher is None
+    assert len(matchers[0].hooks) == 1
+    reason = _denial_reason(_decide_call(agent, "Bash", {"command": "git diff --no-index a b"}))
+    assert "--no-index" in reason
+
+
+@pytest.mark.skipif(os.name != "nt", reason="8.3 short names exist only on Windows")
+def test_a_short_name_path_to_a_hidden_folder_is_refused(make, tmp_path: Path) -> None:
+    """Proves a Read that reaches a hidden folder through its 8.3 short name, written relative
+    or absolute, is refused, and that the reason names the path as written."""
+    folder = tmp_path / ".ratchet"
+    folder.mkdir()
+    (folder / "problems.md").write_text("# Problems", encoding="utf-8")
+    short = _short_name(folder)
+    if not short or Path(short).name == ".ratchet":
+        pytest.skip("this volume makes no short name for .ratchet")
+    agent = make(tools=Tool.READ, confined_to=tmp_path, hidden=(".ratchet", ".ratchet/**"))
+
+    for path in (f"{Path(short).name}/problems.md", f"{short}\\problems.md"):
+        reason = _denial_reason(_decide_call(agent, "Read", {"file_path": path}))
+        assert path in reason, path
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "tool_input", "named"),
+    [
+        ("Read", {"file_path": "OUTSIDE/elsewhere.md"}, "OUTSIDE/elsewhere.md"),
+        ("Read", {"file_path": "../elsewhere.md"}, "../elsewhere.md"),
+        ("Glob", {"pattern": "OUTSIDE/**/*.md"}, "OUTSIDE"),
+        ("Grep", {"pattern": "x", "path": ".."}, ".."),
+        ("NotebookEdit", {"notebook_path": "../n.ipynb", "new_source": ""}, "../n.ipynb"),
+    ],
+)
+def test_a_path_outside_the_folder_is_refused(
+    make, tmp_path: Path, tool_name: str, tool_input: dict, named: str
+) -> None:
+    """Proves a call whose path field or Glob pattern lands outside the folder of 'confined_to',
+    whether absolute or through '..', is refused with a reason that starts with "the path " and
+    names the path. In the cases, OUTSIDE stands for the folder that holds the confined one."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    (tmp_path / "elsewhere.md").write_text("x", encoding="utf-8")
+    outside = tmp_path.as_posix()
+    tool_input = {name: value.replace("OUTSIDE", outside) for name, value in tool_input.items()}
+    agent = make(tools=Tool.INSPECT, cwd=project, confined_to=project)
+
+    reason = _denial_reason(_decide_call(agent, tool_name, tool_input))
+
+    assert reason.startswith("the path ")
+    assert named.replace("OUTSIDE", outside) in reason
+
+
+def test_reads_and_a_grep_without_a_path_inside_are_allowed(make, tmp_path: Path) -> None:
+    """Proves ordinary file tool calls inside the folder are allowed, including a Grep with no
+    path, which searches the agent's folder, and a Glob below a 'path' field."""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "a.py").write_text("x = 1", encoding="utf-8")
+    agent = make(tools=Tool.INSPECT, confined_to=tmp_path, hidden=(".ratchet", ".ratchet/**"))
+
+    assert _decide_call(agent, "Read", {"file_path": "src/a.py"}) == {}
+    assert _decide_call(agent, "Read", {"file_path": str(tmp_path / "src" / "a.py")}) == {}
+    assert _decide_call(agent, "Grep", {"pattern": "def "}) == {}
+    assert _decide_call(agent, "Glob", {"pattern": "**/*.py"}) == {}
+    assert _decide_call(agent, "Glob", {"pattern": "*.py", "path": "src"}) == {}
+
+
+def test_a_hidden_pattern_with_a_later_wildcard_does_not_hide_its_folder(
+    make, tmp_path: Path
+) -> None:
+    """Proves a hidden pattern with a wildcard after its folder, such as "src/**/*.gen.py",
+    does not make the hook refuse calls in that folder, since such a pattern is left to the
+    CLI's Read deny rule."""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "docs" / "private").mkdir(parents=True)
+    agent = make(tools=Tool.INSPECT, confined_to=tmp_path,
+                 hidden=("src/**/*.gen.py", "docs/private/*.md"))
+
+    assert _decide_call(agent, "Read", {"file_path": "src/a.py"}) == {}
+    assert _decide_call(agent, "Grep", {"pattern": "x", "path": "src"}) == {}
+    assert _decide_call(agent, "Read", {"file_path": "docs/private/x.md"}) == {}
+
+
+def test_a_plain_or_folder_star_star_hidden_path_is_refused_by_real_location(
+    make, tmp_path: Path
+) -> None:
+    """Proves a plain hidden path and a "folder/**" hidden pattern, relative or absolute, refuse
+    a call that lands inside them, however the path is written. Every hidden folder lies inside
+    the confined folder, so only the hidden check can refuse these calls."""
+    for name in (".git", "secret", "src", "vault"):
+        (tmp_path / name).mkdir()
+    vault = tmp_path / "vault"
+    agent = make(tools=Tool.INSPECT, confined_to=tmp_path,
+                 hidden=(".git", "secret/**", f"{vault.as_posix()}/**"))
+
+    calls = [
+        ("Read", {"file_path": ".git/config"}, ".git/config"),
+        ("Grep", {"pattern": "x", "path": "secret"}, "secret"),
+        ("Read", {"file_path": "./src/../secret/k"}, "./src/../secret/k"),
+        ("Read", {"file_path": str(vault / "k")}, str(vault / "k")),
+    ]
+    for tool_name, tool_input, named in calls:
+        reason = _denial_reason(_decide_call(agent, tool_name, tool_input))
+        assert named in reason, named
+
+
+def test_a_bash_call_is_not_checked_for_paths(make, tmp_path: Path) -> None:
+    """Proves the hook leaves a Bash command's paths alone, so a command that climbs out with
+    '..' is allowed when no forbidden option is set."""
+    agent = make(tools=Tool.BASH, confined_to=tmp_path)
+
+    assert _decide_call(agent, "Bash", {"command": "cat ../x"}) == {}
+
+
+def _command_for(agent: Agent) -> list[str]:
+    """Builds the CLI command line that a turn of 'agent' would run, without starting it."""
+    from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
+
+    return SubprocessCLITransport(prompt="x", options=agent._options())._build_command()
+
+
+def test_setting_sources_reach_the_options_and_the_command(make, tmp_path: Path) -> None:
+    """Proves setting_sources reaches the options and the CLI command. With no argument the
+    options hold None and the command has no --setting-sources flag, so the CLI loads every
+    settings file as before. An empty tuple sends '--setting-sources=', which loads none."""
+    cli = tmp_path / "claude.exe"
+    cli.write_text("", encoding="utf-8")
+
+    default = make(cli_path=cli)
+    none = make(cli_path=cli, setting_sources=())
+    project = make(cli_path=cli, setting_sources=("project",))
+
+    assert _options_for(default).setting_sources is None
+    assert not any(word.startswith("--setting-sources") for word in _command_for(default))
+    assert _options_for(none).setting_sources == []
+    assert "--setting-sources=" in _command_for(none)
+    assert _options_for(project).setting_sources == ["project"]
+    assert "--setting-sources=project" in _command_for(project)

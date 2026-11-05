@@ -73,6 +73,7 @@ The settings, briefly:
 | `editable`, `frozen` | Path patterns it may change, such as `"src/**"`, and patterns it may never change, such as `"**/*.feature"`. Claude Code enforces both. |
 | `hidden` | Path patterns it may never read, such as an absolute folder outside `cwd`. Claude Code enforces them on Read, Grep and Glob. |
 | `forbidden_options` | Option words that no Bash command may contain, such as `"--no-index"` or `"-C"`. A PreToolUse hook refuses them, including `--opt=value` and git's shortened long options. |
+| `confined_to` | A folder that file tools may not leave. A PreToolUse hook resolves each path a tool call names, links and Windows short names included, and refuses a call that lands outside the folder or inside a plain or `"folder/**"` pattern of `hidden`. |
 | `schema` | A pydantic class that the reply must fit. The reply arrives as an instance of it in `result["data"]`, and a reply that does not fit makes `result["ok"]` False. |
 | `max_work_usd`, `timeout_s` | The most one turn may spend, in dollars, and the longest it may take, in seconds. |
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import os
 import shlex
 from contextlib import aclosing
 from datetime import datetime, timezone
@@ -252,34 +253,158 @@ def _forbidden_option_in(command: str, forbidden: tuple[str, ...]) -> str | None
     return None
 
 
-def _forbidden_options_hook(forbidden: tuple[str, ...]):
-    """Builds a PreToolUse hook that refuses a Bash command that uses a forbidden option.
+# the input fields of a built-in tool that name a file or folder
+_PATH_FIELDS = ("file_path", "path", "notebook_path")
+
+# the characters that make a path pattern match more than one place
+_WILDCARDS = ("*", "?", "[", "{")
+
+
+def _glob_folder(pattern: str) -> str:
+    """Finds the folders at the start of a Glob pattern, before its first wildcard.
+
+    Args:
+        pattern: A Glob pattern, such as "src/**/*.py" or "C:/work/**/*.md".
+
+    Returns:
+        The leading folders of 'pattern', written as they are and ending in a separator, such
+        as "src/" or "C:/work/". A leading "/" or drive is kept. An empty string means that the
+        pattern starts with a wildcard, so it names no folder.
+    """
+    stops = [pattern.index(mark) for mark in _WILDCARDS if mark in pattern]
+    head = pattern[: min(stops)] if stops else pattern
+    cut = max(head.rfind("/"), head.rfind("\\"))
+    return head[: cut + 1]
+
+
+def _resolved_place(value: str, base: str) -> str:
+    """Finds where a path really is, with links and Windows short names expanded.
+
+    Args:
+        value: A path as a tool call wrote it, relative to 'base' or absolute.
+        base: The folder that a relative 'value' is read from.
+
+    Returns:
+        The real path, in the case form that the platform compares with.
+    """
+    return os.path.normcase(os.path.realpath(os.path.join(base, os.path.expanduser(value))))
+
+
+def _is_within(place: str, folder: str) -> bool:
+    """Tells whether a place is a folder itself or lies below it. Both are already resolved."""
+    if place == folder:
+        return True
+    return place.startswith(folder if folder.endswith(os.sep) else folder + os.sep)
+
+
+def _hidden_places(hidden: tuple[str, ...], cwd: str) -> list[str]:
+    """Resolves the hidden patterns that name one folder or file, to their real places.
+
+    A pattern counts when it holds no wildcard, or when it is such a path followed by "/**".
+    Any other pattern is left to the CLI's Read deny rule, because the hook cannot tell which
+    files below a folder it matches.
+
+    Args:
+        hidden: The agent's hidden path patterns.
+        cwd: The folder that a relative pattern is read from.
+
+    Returns:
+        The real place of each pattern that counts.
+    """
+    places = []
+    for pattern in hidden:
+        for ending in ("/**", "\\**"):
+            if pattern.endswith(ending):
+                pattern = pattern[: -len(ending)]
+                break
+        if pattern and not any(mark in pattern for mark in _WILDCARDS):
+            places.append(_resolved_place(pattern, cwd))
+    return places
+
+
+def _misplaced_path(
+    tool_name: str, tool_input: dict, cwd: str, folder: str, places: list[str]
+) -> tuple[str, str] | None:
+    """Finds the first path of a tool call that lands outside a folder or in a hidden place.
+
+    Args:
+        tool_name: The tool being called. Only Glob has a pattern that is checked.
+        tool_input: The tool's input. Its 'file_path', 'path' and 'notebook_path' are checked,
+            and for Glob so are the leading folders of its 'pattern'. A call that names none of
+            these works in 'cwd', which is inside.
+        cwd: The folder that relative paths are read from.
+        folder: The real place of the folder that the call must stay in.
+        places: The real places that the call must stay out of.
+
+    Returns:
+        The offending path as written and the word "outside" or "hidden", or None when every
+        path is fine.
+    """
+    checks = [
+        (tool_input[field], cwd) for field in _PATH_FIELDS if isinstance(tool_input.get(field), str)
+    ]
+    if tool_name == "Glob" and isinstance(tool_input.get("pattern"), str):
+        leading = _glob_folder(tool_input["pattern"])
+        if leading:
+            # a pattern is read from the 'path' field when there is one, else from cwd
+            has_path = isinstance(tool_input.get("path"), str)
+            checks.append((leading, _resolved_place(tool_input["path"], cwd) if has_path else cwd))
+    for written, base in checks:
+        place = _resolved_place(written, base)
+        if not _is_within(place, folder):
+            return written, "outside"
+        if any(_is_within(place, hidden) for hidden in places):
+            return written, "hidden"
+    return None
+
+
+def _pre_tool_use_hook(forbidden: tuple[str, ...], cwd: str, folder: Path | None, hidden: tuple[str, ...]):
+    """Builds a PreToolUse hook that refuses a forbidden Bash option and a misplaced path.
 
     Args:
         forbidden: The option words that no Bash command may contain.
+        cwd: The folder that the agent works in, which relative paths are read from.
+        folder: A folder that file tools may not leave, or None to skip the path check.
+        hidden: The agent's hidden path patterns, which the path check keeps calls out of.
 
     Returns:
         An async callback in the SDK's hook form. It answers with a "deny" decision that names
-        the option, or with an empty dict to leave the call to the other permission rules.
+        the option or the path, or with an empty dict to leave the call to the other permission
+        rules.
     """
+    base = str(cwd)
+    real_folder = _resolved_place(str(folder), base) if folder is not None else None
+    places = _hidden_places(hidden, base) if folder is not None else []
 
-    async def refuse_forbidden_options(input_data, tool_use_id, context) -> dict:
-        if input_data["tool_name"] != "Bash":
-            return {}
-        option = _forbidden_option_in(input_data["tool_input"].get("command", ""), forbidden)
-        if option is None:
-            return {}
+    def deny(reason: str) -> dict:
         return {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",
-                "permissionDecisionReason": (
-                    f"the option {option} is forbidden here, because it reaches outside the project"
-                ),
+                "permissionDecisionReason": reason,
             }
         }
 
-    return refuse_forbidden_options
+    async def refuse_forbidden_options_and_misplaced_paths(input_data, tool_use_id, context) -> dict:
+        tool_name = input_data["tool_name"]
+        tool_input = input_data["tool_input"]
+        # a Bash command is checked for forbidden options only
+        if tool_name == "Bash":
+            option = _forbidden_option_in(tool_input.get("command", ""), forbidden)
+            if option is None:
+                return {}
+            return deny(f"the option {option} is forbidden here, because it reaches outside the project")
+        if real_folder is None:
+            return {}
+        found = _misplaced_path(tool_name, tool_input, base, real_folder, places)
+        if found is None:
+            return {}
+        path, kind = found
+        if kind == "outside":
+            return deny(f"the path {path} is outside {folder}, so it is refused")
+        return deny(f"the path {path} is hidden from this agent, so it is refused")
+
+    return refuse_forbidden_options_and_misplaced_paths
 
 
 class Agent:
@@ -326,10 +451,12 @@ class Agent:
         frozen: tuple[str, ...] = (),
         hidden: tuple[str, ...] = (),
         forbidden_options: tuple[str, ...] = (),
+        confined_to: Path | None = None,
         schema: type[BaseModel] | None = None,
         max_work_usd: float | None = None,
         timeout_s: int | None = None,
         safe_mode: bool = True,
+        setting_sources: tuple[str, ...] | None = None,
         permission_mode: PermissionMode | str = PermissionMode.ACCEPT_EDITS,
         session_id: str | None = None,
         cli_path: Path | None = None,
@@ -360,17 +487,25 @@ class Agent:
                 inside 'editable', such as "**/*.feature".
             hidden: Path patterns that the agent may never read, relative to 'cwd' or absolute,
                 such as "secrets/**" or a folder outside 'cwd'. Claude Code enforces them on
-                Read, Grep and Glob.
+                Read, Grep and Glob. With 'confined_to', the plain and "folder/**" patterns are
+                also enforced by real location.
             forbidden_options: Command-line option words that no Bash command may contain, such
                 as "--no-index" or "-C". A PreToolUse hook refuses them, even on calls that the
                 allow rules approve. A long option also catches its "=value" form and git's
                 shortened forms, such as "--outp" for "--output".
+            confined_to: A folder that file tools may not leave. A PreToolUse hook resolves each
+                path that a tool call names, links and short names included, and refuses a call
+                that lands outside the folder or inside a plain or "folder/**" pattern of
+                'hidden'. None leaves paths to the permission rules.
             schema: A pydantic class that the reply must fit. The reply then arrives as an
                 instance of it in the result's "data".
             max_work_usd: The most that one turn may spend, in dollars. None means no limit.
             timeout_s: The longest that one turn may take, in seconds. None means no limit.
             safe_mode: True runs the CLI in safe mode, which leaves out CLAUDE.md, hooks and
                 skills.
+            setting_sources: The Claude settings files that the CLI loads, from "user", "project"
+                and "local". None leaves the CLI's default, which loads them all. An empty tuple
+                loads none, so no settings file's allow rules, env or model reach the agent.
             permission_mode: The CLI's permission mode. The default lets file edits through
                 without asking, unless 'editable' is given.
             session_id: A session to resume, saved from an earlier run. It is used only when
@@ -410,10 +545,12 @@ class Agent:
         self.frozen = frozen
         self.hidden = hidden
         self.forbidden_options = forbidden_options
+        self.confined_to = confined_to
         self.schema = schema
         self.max_work_usd = max_work_usd
         self.timeout_s = timeout_s
         self.safe_mode = safe_mode
+        self.setting_sources = setting_sources
         self.permission_mode = permission_mode
         self.cli_path = cli_path
 
@@ -516,9 +653,23 @@ class Agent:
             resume=self.session_id if self.remembers and self.session_id else None,
             # a hook runs on every call, but an allow rule approves a call before can_use_tool is asked
             hooks=(
-                {"PreToolUse": [HookMatcher(matcher="Bash", hooks=[_forbidden_options_hook(self.forbidden_options)])]}
-                if self.forbidden_options
+                {
+                    "PreToolUse": [
+                        HookMatcher(
+                            matcher=None if self.confined_to is not None else "Bash",
+                            hooks=[
+                                _pre_tool_use_hook(
+                                    self.forbidden_options, self.cwd, self.confined_to, self.hidden
+                                )
+                            ],
+                        )
+                    ]
+                }
+                if self.forbidden_options or self.confined_to is not None
                 else None
+            ),
+            setting_sources=(
+                list(self.setting_sources) if self.setting_sources is not None else None
             ),
             cwd=self.cwd,
             cli_path=self.cli_path,
