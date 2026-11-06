@@ -1,170 +1,201 @@
 # agent-rooster
 
-A harness for running Claude Code agents from Python.
+Build workflows of AI agents in Python that run on your Claude subscription, not on a
+pay-per-token API.
 
-agent-rooster lets you define an agent, run it, and get its answer back as data your
-script can act on. It also runs several agents through a graph of steps, saving each job
-to disk so that it can pause for a person and resume later, even from a new process.
+## What it is
 
-It knows nothing about code, tests or git, and ships no roles or workflows of its own.
-Tools built on it bring that knowledge. ratchet, a coding tool with `refactor`, `feature`
-and `debug` commands, is the first one planned.
+agent-rooster is a small Python library. It lets you:
 
-Agents run through Anthropic's [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python),
-which drives the `claude` CLI. So an agent can use Claude Code's tools and file editing,
-and it runs against your Claude plan.
+- **Run a Claude agent from Python** and get its answer back as data your code can use.
+- **Connect several steps into a workflow.** A step can call an agent, run ordinary code
+  (such as your tests), or both. Your code decides which step comes next, not the AI.
+- **Pause a workflow for a person** and pick it up later, even after closing the program.
+- **Keep each agent inside strict limits**: which files it may read, which it may change, and
+  which commands it may run.
+
+Each agent is a real Claude Code agent. It can read, search and edit files and run commands,
+using Claude Code's own tools, so you do not have to write those tools yourself.
+
+## Why it exists
+
+Popular frameworks for agent workflows (e.g., LangGraph) typically call an AI model through an API. You pay for every token. If you already pay for a Claude Pro or Max plan, that may feel like paying twice.
+
+agent-rooster runs every agent through Claude Code using your own plan. Your workflows use your plan's usage limits instead of a token bill.
+
+It uses Anthropic's Claude Agent SDK to configure and run agents, and checks each agent's answer against a shape that you define. Its AgentGraph runs complicated workflows in which your code, not the AI, decides what happens next.
+
+[code-ratchet](https://github.com/nikhilchandra/code-ratchet), a tool that audits and
+refactors Python projects with a team of agents, is built on agent-rooster.
+
+## What you need
+
+- Python 3.11 or newer
+- [uv](https://docs.astral.sh/uv/), a Python package manager
+- [Claude Code](https://docs.claude.com/en/docs/claude-code), installed and signed in with
+  your Claude plan
 
 ## Install
 
-agent-rooster is a library. Add it to another project's `pyproject.toml` as an editable
-path, so changes here show up there at once:
+```bash
+git clone https://github.com/nikhilchandra/agent-rooster
+cd agent-rooster
+uv sync
+uv run pytest        # runs the tests, with no calls to Claude
+```
+
+To use it in your own project, add it as a dependency. You install `agent-rooster`, and you
+import `rooster`.
 
 ```toml
 [project]
 dependencies = ["agent-rooster"]
 
 [tool.uv.sources]
-agent-rooster = { path = "../agent-rooster", editable = true }
+agent-rooster = { git = "https://github.com/nikhilchandra/agent-rooster" }
 ```
 
-## Agents
+## Your first agent
 
-An agent is a profile, which is a markdown file holding its standing instructions, plus
-the settings below.
+An agent is a set of instructions in a markdown file, plus a few settings.
 
 ```python
 from pathlib import Path
 from pydantic import BaseModel
 from rooster import Agent, Command, Model, Tool
 
+# the shape the agent's answer must have
 class Verdict(BaseModel):
     accepted: bool
     reason: str
 
 reviewer = Agent(
     "reviewer",
-    Path("profiles/reviewer.md"),
-    cwd=Path("."),
-    log_dir=Path(".rooster/logs/reviewer"),
+    Path("profiles/reviewer.md"),        # the agent's instructions (this file must exist)
+    cwd=Path("."),                       # the folder it works in
+    log_dir=Path(".rooster/logs"),       # one log file per turn
     model=Model.OPUS,
-    tools=Tool.INSPECT,                       # read-only: Read, Glob and Grep
+    tools=Tool.INSPECT,                  # it may read files, but not change them
     commands=Command.PYTEST | Command.GIT_READ,
     schema=Verdict,
-    max_work_usd=3.0,
-    timeout_s=1800,
+    max_work_usd=3.0,                    # usage cap: stop the turn once it would have cost $3 at API prices
 )
 
-result = reviewer.run("Review the diff in the working tree.")
+result = reviewer.run("Review the changes in this folder.")
 if result["ok"]:
     print(result["data"].accepted, result["data"].reason)
 else:
-    print(result["failure"])
+    print("The turn failed:", result["failure"])
 ```
 
-The settings, briefly:
+**Note**: On a subscription plan, nothing is billed. The cost is Claude Code's estimate at API 
+prices, which rooster uses to cap usage and to track what each job used.
 
-| Setting | What it does |
-|---|---|
-| `cwd`, `log_dir` | Where the agent works, and where it writes one log file per turn. Both are required. A log is written line by line, so you can watch a long turn live. |
-| `remembers` | False (the default) starts every turn fresh, so the prompt must carry everything the agent needs. True continues one conversation across all of the agent's turns. |
-| `model`, `effort` | Which model, and how much it thinks. |
-| `tools` | The built-in tools the agent may use, such as `Tool.INSPECT` (read only) or `Tool.AUTHOR` (read and edit). |
-| `commands` | The shell commands it may run, such as `Command.PYTEST`, `Command.GIT_MV`, `Command.GIT_RM` and `Command.GIT_READ`. `Tool.BASH` allows every command instead. |
-| `editable`, `frozen` | Path patterns it may change, such as `"src/**"`, and patterns it may never change, such as `"**/*.feature"`. Claude Code enforces both. |
-| `hidden` | Path patterns it may never read, such as an absolute folder outside `cwd`. Claude Code enforces them on Read, Grep and Glob. |
-| `forbidden_options` | Option words that no Bash command may contain, such as `"--no-index"` or `"-C"`. A PreToolUse hook refuses them, including `--opt=value` and git's shortened long options. |
-| `confined_to` | A folder that file tools may not leave. A PreToolUse hook resolves each path a tool call names, links and Windows short names included, and refuses a call that lands outside the folder or inside a plain or `"folder/**"` pattern of `hidden`. |
-| `schema` | A pydantic class that the reply must fit. The reply arrives as an instance of it in `result["data"]`, and a reply that does not fit makes `result["ok"]` False. |
-| `max_work_usd`, `timeout_s` | The most one turn may spend, in dollars, and the longest it may take, in seconds. |
+If the agent's answer does not fit `Verdict`, `result["ok"]` is False and you get the reason
+instead.
 
-`run()` waits for the turn to finish. `arun()` is the same for async code, which lets
-several agents work at once:
+## Your first workflow
+
+A workflow is a set of named steps. Each step is a plain function that returns the name of
+the next step, or `None` to finish. Every step lists where it may go next, so a typo is
+caught before any agent runs.
 
 ```python
-first, second = await asyncio.gather(reviewer_a.arun(prompt), reviewer_b.arun(prompt))
-```
+import subprocess
+from pathlib import Path
 
-One agent must not run two turns at once. Use separate agents instead.
-
-The `Agent` class docstring lists every key of the result dict.
-
-## Graphs and jobs
-
-A graph is a set of named steps. A step is a plain function that takes the `Job`, does its
-work, and returns the name of the next step, or None to finish. Each step declares every
-step it may go to with `next=`, so a typo is caught before any agent runs.
-
-- **A loop** is a step that returns an earlier step's name.
-- **A gate** is a step declared with `gate=True`. The job pauses after it until you call
-  `resume()`. Pass `resume(slug, data={...})` to hand the job a decision, such as an
-  owner's answers. Each key is written into `job.data` before the next step runs.
-- **A check** is ordinary Python inside a step, such as running the tests, with no agent
-  involved.
-
-```python
 from rooster import AgentGraph, Job
 
+# writer is an Agent defined like reviewer above, with remembers=True and no schema
 graph = AgentGraph("review", {"writer": writer, "reviewer": reviewer},
                    start="write", state_dir=Path(".rooster"))
 
 @graph.step("write", next=("test",))
 def write(job: Job) -> str:
-    writer.run(job.prompt)
+    feedback = job.data.pop("feedback", "")
+    writer.run(f"{job.prompt}\n\n{feedback}".strip())   # an agent step
     return "test"
 
 @graph.step("test", next=("review", "write"))
 def test(job: Job) -> str:
-    passed = subprocess.run(["uv", "run", "pytest"]).returncode == 0
-    return "review" if passed else "write"
+    tests = subprocess.run(["uv", "run", "pytest"], capture_output=True, text=True)
+    if tests.returncode == 0:
+        return "review"                                  # a code step, with no agent
+    job.data["feedback"] = f"The tests failed:\n{tests.stdout[-2000:]}"
+    return "write"
 
 @graph.step("review", next=("write", None), gate=True)
 def review(job: Job) -> str | None:
-    verdict = reviewer.run("Review the diff.")["data"]
-    return None if verdict.accepted else "write"
+    result = reviewer.run("Review the changes.")
+    if not result["ok"]:
+        raise RuntimeError(result["failure"])            # halts the job with this reason
+    if result["data"].accepted:
+        return None
+    job.data["feedback"] = f"The reviewer rejected the changes: {result['data'].reason}"
+    return "write"
 
-job = graph.start("Add a --verbose flag to the CLI")
-if job.waiting:
+job = graph.start("Add a --verbose flag to the command line")
+while job.waiting:            # paused after each review, so a person can look
     job = graph.resume(job.slug)
 ```
 
-A job is one trip through the graph. Each job is saved as a JSON file under
-`state_dir/<graph name>/`, holding its next step, its status, what it has cost, the
-session ids of agents that remember, and `job.data`, where steps keep anything they need
-later. To work through many tasks, such as a list of problems, write a loop in your own
-code that starts one job per task.
+A few things to know:
 
-`graph.diagram()` returns the graph as a Mermaid flowchart, which GitHub and VS Code draw
-as a picture:
+- **A loop** is just a step that returns an earlier step's name.
+- **A gate** (`gate=True`) pauses the job after that step. `resume()` continues it, and
+  `resume(slug, data={...})` hands it a person's decision.
+- **Each job is saved** as a JSON file after every step, with its next step, its cost and
+  any data the steps keep. That is what lets a paused job continue later, in a new process.
+- **A job that fails is marked halted.** It does not pick up where it failed. Start a new job
+  instead.
+- `graph.diagram()` draws the workflow as a Mermaid flowchart, which GitHub shows as a
+  picture.
 
-```
-flowchart TD
-    start((start)) --> s0
-    s0["write"]
-    s1["test"]
-    s2["review (gate)"]
-    s0 --> s1
-    s1 --> s2
-    s1 --> s0
-    s2 --> s0
-    s2 --> finish((finish))
-```
+## Keeping agents in bounds
+
+You decide what each agent may touch. Claude Code and agent-rooster enforce it, so the agent
+cannot simply ignore it.
+
+| Setting | What it does |
+|---|---|
+| `tools` | Which of Claude Code's tools the agent has, such as read-only or read-and-edit |
+| `commands` | Which shell commands it may run, such as `pytest` or read-only git |
+| `editable` | The files it may change, such as `"src/**"` |
+| `frozen` | Files it may never change, such as tests written before the code |
+| `hidden` | Files and folders it may never read |
+| `confined_to` | A folder its file tools may not leave. Each path is checked by where it really points, so links, `..` and Windows short names cannot get around it |
+| `forbidden_options` | Command options that are refused before the command runs, such as git's `--no-index`, which can read files outside the project |
+| `setting_sources` | Which Claude Code settings files the agent loads. An empty list loads none, so a settings file cannot quietly grant extra permissions |
+| `max_work_usd`, `timeout_s` | The most one turn may cost, and how long it may take |
+
+## About using your subscription
+
+- This is for running agents on **your own work**. Anthropic's terms allow you to sign in to
+  Claude Code with your own plan, and its usage limits "assume ordinary, individual usage of
+  Claude Code and the Agent SDK."
+- Workflows with many agents use up your plan's 5-hour and weekly limits faster, and they
+  share those limits with the rest of your Claude use.
+- Do not use a subscription to serve other people or to run a hosted product. Use an API key
+  for that. See Anthropic's
+  [legal and compliance page](https://code.claude.com/docs/en/legal-and-compliance).
+- If `ANTHROPIC_API_KEY` is set on your machine, Claude Code uses it and bills the API instead
+  of your plan.
+- Anthropic has changed these rules more than once, so check the current terms.
+
+## Related work
+
+If you already use LangGraph, [langchain-claude-cli](https://github.com/clriesco/langchain-claude-cli)
+lets it run on a Claude subscription too, and LangGraph's workflow engine is more mature than
+this one. agent-rooster is smaller, and it focuses on keeping each agent inside strict limits
+on files and commands.
 
 ## Tests
 
 ```bash
-uv run pytest -m "not live"   # free, no Claude calls
-uv run pytest                 # also runs the live tests, which spend a little of your plan
+uv run pytest            # free, with no calls to Claude
+uv run pytest -m live    # calls the real Claude Code and uses a little of your plan
 ```
 
-## Status
+## License
 
-Working now: agents, parallel agents, permissions, schemas, live logs, graphs with
-loops, gates and checks, and diagrams.
-
-Planned next, in order:
-1. A halted job keeps its place, so it can resume from the step that failed.
-2. Several jobs at once, with a lock per job and a progress log.
-3. A dollar cap per job, and ways to stop a job between steps.
-4. Waiting out the plan's usage limits instead of failing.
-5. Checking an agent's permissions before a long job, without calling Claude.
-6. Building blocks for a project's own command line.
+MIT. See [LICENSE](LICENSE).
