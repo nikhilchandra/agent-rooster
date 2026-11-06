@@ -1,7 +1,9 @@
 [project]
 name = "agent-rooster"
 version = "0.1.0"
-description = "Infrastructure for building agentic workflows on the Claude Code CLI."
+description = "Build workflows of Claude agents in Python that run on your Claude subscription."
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
     "claude-agent-sdk>=0.2.160",
