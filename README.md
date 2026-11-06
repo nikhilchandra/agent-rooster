@@ -55,6 +55,24 @@ dependencies = ["agent-rooster"]
 agent-rooster = { git = "https://github.com/nikhilchandra/agent-rooster" }
 ```
 
+## Try it
+
+[examples/review](examples/review) holds a working example: a tiny project with one function,
+and a writer and a reviewer, each with its own instructions in a markdown file. The writer
+adds a function with a test, the tests run, and the reviewer judges the change. It pauses for
+you before it starts, so you can look at the starting code, and after each review.
+
+```bash
+uv run python examples/review/run.py
+```
+
+It copies the project into `examples/review/work/` first, so you can see what the writer
+changed. The writer edits only that copy, and git ignores it and the run's logs, so a run
+leaves no changes in the repository. A run uses a few cents of your plan's usage, measured at
+API prices.
+
+The two sections below walk through the same pieces.
+
 ## Your first agent
 
 An agent is a set of instructions in a markdown file, plus a few settings.

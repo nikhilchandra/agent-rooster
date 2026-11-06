@@ -21,6 +21,8 @@ build-backend = "hatchling.build"
 packages = ["src/rooster"]
 
 [tool.pytest.ini_options]
+# the example under examples/ has a test project of its own, which is not rooster's test suite
+testpaths = ["tests"]
 # the live tests call the claude CLI and spend tokens, so they run only when asked for with -m live
 addopts = "-m 'not live'"
 markers = [
